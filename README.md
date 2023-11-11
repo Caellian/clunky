@@ -30,15 +30,13 @@ cargo build --release --features wlr
     - [ ] ImageButton
 - [ ] Wayland support
   - [x] Window creation
-  - [ ] wlr-layer-shell support
-  - [ ] GNOME compositor support
+  - [x] wlr-layer-shell support
   - [ ] KWin support
 - [ ] Process forking
 - [ ] Recreate _some_ conky functionality
   - CPU load & temp., memory usage, uptime / boot time, battery life, FS mounts, disk usage, disk IO, network, network traffic stats
 - [ ] Actions
   - [ ] Running applications & scripts
-- [ ] Drawing SVG components/images using [forma](https://github.com/google/forma)
 - [ ] Allow running custom shaders for surfaces
   - [ ] Background mode
 - [ ] Windows support

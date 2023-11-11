@@ -1,3 +1,7 @@
+function test_component(canvas, settings)
+
+end
+
 function layout()
     add_component({
         type = "Button",

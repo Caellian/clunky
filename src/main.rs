@@ -7,7 +7,7 @@ use error::ClunkyError;
 use glam::{IVec2, UVec2};
 use layout::Layout;
 use math::rect::Rect;
-use render::{RenderTarget, RenderTargetImpl, TargetConfig};
+use render::{skia::draw, RenderBuffer, RenderTarget, RenderTargetImpl, TargetConfig};
 
 use crate::script::Context;
 
@@ -41,15 +41,21 @@ fn main() {
         Ok(()) => {}
     }
 
-    let (mut target, mut queue) = RenderTargetImpl::create(TargetConfig {
-        position: IVec2::new(50, 100),
-        size: UVec2::new(800, 600),
-        ..Default::default()
-    })
+    let buffer = RenderBuffer::new();
+
+    let (mut target, mut queue) = RenderTargetImpl::create(
+        TargetConfig {
+            position: IVec2::new(50, 100),
+            size: UVec2::new(800, 600),
+            ..Default::default()
+        },
+        buffer,
+    )
     .expect("unable to create a render target");
 
     while target.active() {
         queue.dispatch_pending(&mut target).unwrap();
         let _ = queue.flush();
+        draw(target.buffer());
     }
 }

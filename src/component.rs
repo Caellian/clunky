@@ -1,18 +1,23 @@
 use rlua::Table;
 
-use crate::{
-    error::{self, ClunkyError, ValueType},
-};
+use crate::error::{self, ClunkyError, ValueType};
 
 pub trait Component: 'static {
     fn component_type_name(&self) -> String;
 
-    fn try_from_lua_table<'l>(table: &Table<'l>) -> error::Result<Box<dyn Component>> where Self: Sized;
+    fn try_from_lua_table<'l>(table: &Table<'l>) -> error::Result<Box<dyn Component>>
+    where
+        Self: Sized;
 }
 
 macro_rules! get_component_property {
     ($table: ident, $name: literal, $kind: path) => {
-        $table.get($name).map_err(|_| ClunkyError::MissingComponentProperty { name: $name, value: $kind })
+        $table
+            .get($name)
+            .map_err(|_| ClunkyError::MissingComponentProperty {
+                name: $name,
+                value: $kind,
+            })
     };
 }
 
@@ -78,10 +83,7 @@ macro_rules! declare_parsers {
     };
 }
 
-declare_parsers![
-    Label,
-    Button
-];
+declare_parsers![Label, Button];
 
 pub fn try_component_from_lua_table<'l>(table: &Table<'l>) -> error::Result<Box<dyn Component>> {
     let ty: String = table.raw_get("type")?;
@@ -100,12 +102,12 @@ pub fn try_component_from_lua_table<'l>(table: &Table<'l>) -> error::Result<Box<
 
     for (name, table_parser) in COMPONENT_PARSERS.iter() {
         if *name == ty {
-            return Ok(table_parser(table)?)
+            return Ok(table_parser(table)?);
         }
     }
 
     return Err(ClunkyError::UnknownComponent {
         found: ty,
-        detail: error::Detail(None)
+        detail: error::Detail(None),
     });
 }

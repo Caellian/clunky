@@ -1,9 +1,12 @@
 use std::{
     fs::File,
+    hash::BuildHasher,
     os::fd::{AsFd, AsRawFd},
 };
 
 use glam::{IVec2, UVec2};
+use image::buffer;
+use skia_safe::luma_color_filter::new;
 use wayland_client::{
     protocol::{
         wl_buffer::{self, WlBuffer},
@@ -11,7 +14,9 @@ use wayland_client::{
         wl_keyboard::{self, KeyState, WlKeyboard},
         wl_pointer::{self, WlPointer},
         wl_registry::{self, WlRegistry},
-        wl_seat, wl_shm, wl_shm_pool,
+        wl_seat,
+        wl_shm::{self, WlShm},
+        wl_shm_pool::{self, WlShmPool},
         wl_surface::{self, WlSurface},
     },
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
@@ -23,7 +28,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 use crate::{error::RenderError, require_some};
 
-use super::{RenderTarget, TargetConfig};
+use super::{RenderBuffer, RenderTarget, TargetConfig};
 
 pub struct WaylandState {
     running: bool,
@@ -33,8 +38,12 @@ pub struct WaylandState {
 
     anchor: Anchor,
 
+    buffer: RenderBuffer,
+
+    memory_pool: Option<WlShmPool>,
+
     wl_surface: Option<WlSurface>,
-    buffer: Option<WlBuffer>,
+    wl_buffer: Option<WlBuffer>,
 
     layer_shell: Option<ZwlrLayerShellV1>,
     layer_surface: Option<ZwlrLayerSurfaceV1>,
@@ -79,7 +88,10 @@ impl WaylandState {
 }
 
 impl RenderTarget<EventQueue<Self>> for WaylandState {
-    fn create(config: TargetConfig) -> crate::error::Result<(Self, EventQueue<Self>)> {
+    fn create(
+        config: TargetConfig,
+        buffer: RenderBuffer,
+    ) -> crate::error::Result<(Self, EventQueue<Self>)> {
         let connection =
             Connection::connect_to_env().map_err(|err| RenderError::WaylandConnect(err))?;
 
@@ -98,8 +110,11 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
                 size: config.size,
                 anchor: config.anchor,
 
+                buffer,
+
+                memory_pool: None,
                 wl_surface: None,
-                buffer: None,
+                wl_buffer: None,
                 layer_shell: None,
                 layer_surface: None,
                 keyboard: None,
@@ -130,8 +145,41 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
         Ok(())
     }
 
-    fn resize(&mut self, new_size: UVec2) -> crate::error::Result<()> {
+    fn resize(&mut self, new_size: UVec2, qh: &QueueHandle<Self>) -> crate::error::Result<()> {
+        self.size = new_size;
+        self.buffer.ensure_capacity(new_size, 4);
+        let pool = self
+            .memory_pool
+            .as_mut()
+            .expect("shared memory pool not initialized");
+        pool.resize((new_size.x * new_size.y) as i32 * 4);
+
+        // FIXME: Double-buffer so we don't destroy the buffer while it's still
+        // in use. Prediction: flickering
+        if let Some(buffer) = self.wl_buffer.as_ref() {
+            buffer.destroy()
+        }
+        let buffer = pool.create_buffer(
+            0,
+            new_size.x as i32,
+            new_size.y as i32,
+            (new_size.x * 4) as i32,
+            wl_shm::Format::Argb8888,
+            qh,
+            (),
+        );
+
+        if let Some(surface) = self.wl_surface.as_ref() {
+            surface.attach(Some(&buffer), 0, 0);
+            surface.commit();
+        }
+        self.wl_buffer = Some(buffer);
+
         Ok(())
+    }
+
+    fn buffer(&mut self) -> &mut RenderBuffer {
+        &mut self.buffer
     }
 
     fn destroy(&mut self) -> crate::error::Result<()> {
@@ -159,30 +207,13 @@ fn position_to_margins(anchor: Anchor, position: IVec2) -> (i32, i32, i32, i32) 
     (top, right, bottom, left)
 }
 
-fn draw(tmp: &mut File, (buf_x, buf_y): (u32, u32)) {
-    use std::{cmp::min, io::Write};
-    let mut buf = std::io::BufWriter::new(tmp);
-    for y in 0..buf_y {
-        for x in 0..buf_x {
-            let a = 0xFF;
-            let r = min(((buf_x - x) * 0xFF) / buf_x, ((buf_y - y) * 0xFF) / buf_y);
-            let g = min((x * 0xFF) / buf_x, ((buf_y - y) * 0xFF) / buf_y);
-            let b = min(((buf_x - x) * 0xFF) / buf_x, (y * 0xFF) / buf_y);
-
-            let color = (a << 24) + (r << 16) + (g << 8) + b;
-            buf.write_all(&color.to_ne_bytes()).unwrap();
-        }
-    }
-    buf.flush().unwrap();
-}
-
 impl Dispatch<WlRegistry, ()> for WaylandState {
     fn event(
         state: &mut Self,
         registry: &WlRegistry,
         event: <WlRegistry as wayland_client::Proxy>::Event,
-        data: &(),
-        conn: &Connection,
+        _: &(),
+        _: &Connection,
         qh: &wayland_client::QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global {
@@ -202,10 +233,9 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
                 "wl_shm" => {
                     let shm: wl_shm::WlShm = registry.bind(name, 1, qh, ());
 
-                    let mut file = tempfile::tempfile().unwrap();
-                    draw(&mut file, (state.size.x, state.size.y));
+                    state.buffer.ensure_capacity(state.size, 4);
                     let pool = shm.create_pool(
-                        file.as_fd(),
+                        state.buffer.as_fd(),
                         (state.size.x * state.size.y * 4) as i32,
                         qh,
                         (),
@@ -219,13 +249,15 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
                         qh,
                         (),
                     );
-                    state.buffer = Some(buffer.clone());
+                    state.wl_buffer = Some(buffer.clone());
 
                     if state.configured {
                         let surface = state.wl_surface.as_ref().unwrap();
                         surface.attach(Some(&buffer), 0, 0);
                         surface.commit();
                     }
+
+                    state.memory_pool = Some(pool);
                 }
                 "wl_seat" => {
                     registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, ());
@@ -278,25 +310,7 @@ impl Dispatch<WlSurface, ()> for WaylandState {
     }
 }
 
-impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
-    fn event(
-        _: &mut Self,
-        _: &wl_shm::WlShm,
-        event: wl_shm::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_shm::Event::Format { .. } => {
-                // TODO: Move buffer creation to wl_shm::WlShm handler when
-                // available formats are known
-            }
-            _ => {}
-        }
-    }
-}
-
+stub_listener!(wl_shm::WlShm);
 stub_listener!(wl_shm_pool::WlShmPool);
 stub_listener!(wl_buffer::WlBuffer);
 
@@ -394,7 +408,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for WaylandState {
                 let wl_surface = state.wl_surface.as_ref().unwrap();
                 wl_surface.commit();
 
-                if let Some(buffer) = &state.buffer {
+                if let Some(buffer) = &state.wl_buffer {
                     wl_surface.attach(Some(buffer), 0, 0);
                     wl_surface.commit();
                 }
