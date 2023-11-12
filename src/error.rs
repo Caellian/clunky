@@ -55,6 +55,14 @@ macro_rules! unknown_component {
 }
 
 #[derive(Debug, Error)]
+pub enum FrameBufferError {
+    #[error("can't move framebuffer while it's being writen to by {0} threads")]
+    MmapInUse(u32),
+    #[error(transparent)]
+    IO(#[from] std::io::Error),
+}
+
+#[derive(Debug, Error)]
 pub enum RenderError {
     #[error(transparent)]
     #[cfg(feature = "wayland")]
@@ -76,6 +84,8 @@ pub enum ClunkyError {
         value: ValueType,
     },
 
+    #[error(transparent)]
+    FrameBuffer(#[from] FrameBufferError),
     #[error(transparent)]
     Render(#[from] RenderError),
     #[error(transparent)]

@@ -2,11 +2,13 @@ use std::{
     fs::File,
     hash::BuildHasher,
     os::fd::{AsFd, AsRawFd},
+    thread::sleep,
 };
 
 use glam::{IVec2, UVec2};
 use image::buffer;
 use skia_safe::luma_color_filter::new;
+use systemstat::Duration;
 use wayland_client::{
     protocol::{
         wl_buffer::{self, WlBuffer},
@@ -19,7 +21,7 @@ use wayland_client::{
         wl_shm_pool::{self, WlShmPool},
         wl_surface::{self, WlSurface},
     },
-    Connection, Dispatch, EventQueue, QueueHandle, WEnum,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
@@ -28,7 +30,11 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 use crate::{error::RenderError, require_some};
 
-use super::{RenderBuffer, RenderTarget, TargetConfig};
+use super::{FrameBuffer, OwnerState, RenderTarget, TargetConfig};
+
+pub enum StateMutation {
+    Resize(UVec2),
+}
 
 pub struct WaylandState {
     running: bool,
@@ -38,7 +44,7 @@ pub struct WaylandState {
 
     anchor: Anchor,
 
-    buffer: RenderBuffer,
+    buffer: FrameBuffer,
 
     memory_pool: Option<WlShmPool>,
 
@@ -90,7 +96,7 @@ impl WaylandState {
 impl RenderTarget<EventQueue<Self>> for WaylandState {
     fn create(
         config: TargetConfig,
-        buffer: RenderBuffer,
+        buffer: FrameBuffer,
     ) -> crate::error::Result<(Self, EventQueue<Self>)> {
         let connection =
             Connection::connect_to_env().map_err(|err| RenderError::WaylandConnect(err))?;
@@ -146,6 +152,7 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
     }
 
     fn resize(&mut self, new_size: UVec2, qh: &QueueHandle<Self>) -> crate::error::Result<()> {
+        log::info!("Resizing surface to: {}x{}", new_size.x, new_size.y);
         self.size = new_size;
         self.buffer.ensure_capacity(new_size, 4);
         let pool = self
@@ -154,12 +161,7 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
             .expect("shared memory pool not initialized");
         pool.resize((new_size.x * new_size.y) as i32 * 4);
 
-        // FIXME: Double-buffer so we don't destroy the buffer while it's still
-        // in use. Prediction: flickering
-        if let Some(buffer) = self.wl_buffer.as_ref() {
-            buffer.destroy()
-        }
-        let buffer = pool.create_buffer(
+        let mut buffer = Some(pool.create_buffer(
             0,
             new_size.x as i32,
             new_size.y as i32,
@@ -167,18 +169,27 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
             wl_shm::Format::Argb8888,
             qh,
             (),
-        );
+        ));
 
         if let Some(surface) = self.wl_surface.as_ref() {
-            surface.attach(Some(&buffer), 0, 0);
+            surface.attach(buffer.as_ref(), 0, 0);
+            if self.buffer.set_owner(OwnerState::Compositor) {
+                panic!(
+                    "can't pass buffer ownership to compositor; owner is: {:?}",
+                    self.buffer.get_owner()
+                )
+            }
             surface.commit();
         }
-        self.wl_buffer = Some(buffer);
+        std::mem::swap(&mut buffer, &mut self.wl_buffer);
+        if let Some(prev_buffer) = buffer {
+            prev_buffer.destroy();
+        }
 
         Ok(())
     }
 
-    fn buffer(&mut self) -> &mut RenderBuffer {
+    fn buffer(&mut self) -> &mut FrameBuffer {
         &mut self.buffer
     }
 
@@ -254,6 +265,9 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
                     if state.configured {
                         let surface = state.wl_surface.as_ref().unwrap();
                         surface.attach(Some(&buffer), 0, 0);
+                        if state.buffer.set_owner(OwnerState::Compositor) {
+                            panic!("can't pass buffer ownership to compositor")
+                        }
                         surface.commit();
                     }
 
@@ -312,7 +326,31 @@ impl Dispatch<WlSurface, ()> for WaylandState {
 
 stub_listener!(wl_shm::WlShm);
 stub_listener!(wl_shm_pool::WlShmPool);
-stub_listener!(wl_buffer::WlBuffer);
+
+impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        buffer: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_buffer::Event::Release => {
+                if state
+                    .wl_buffer
+                    .as_ref()
+                    .map(|it| it.id() == buffer.id())
+                    .unwrap_or_default()
+                {
+                    state.buffer.clear_owner(OwnerState::Compositor);
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
     fn event(

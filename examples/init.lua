@@ -1,6 +1,6 @@
-function test_component(canvas, settings)
-
-end
+settings = {
+    a: "test"
+}
 
 function layout()
     add_component({
