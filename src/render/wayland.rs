@@ -6,13 +6,13 @@ use std::{
 };
 
 use glam::{IVec2, UVec2};
-use image::buffer;
+use image::{buffer, Frame};
+use parking_lot::Condvar;
 use skia_safe::luma_color_filter::new;
-use systemstat::Duration;
 use wayland_client::{
     protocol::{
         wl_buffer::{self, WlBuffer},
-        wl_compositor,
+        wl_callback, wl_compositor,
         wl_keyboard::{self, KeyState, WlKeyboard},
         wl_pointer::{self, WlPointer},
         wl_registry::{self, WlRegistry},
@@ -28,12 +28,18 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
-use crate::{error::RenderError, require_some};
+use crate::{
+    error::{ClunkyError, RenderError},
+    require_some,
+};
 
-use super::{FrameBuffer, OwnerState, RenderTarget, TargetConfig};
+use super::{
+    buffer::{ColorFormat, FrameParameters},
+    FrameBuffer, RenderTarget, TargetConfig,
+};
 
-pub enum StateMutation {
-    Resize(UVec2),
+pub enum CallbackKind {
+    Frame,
 }
 
 pub struct WaylandState {
@@ -44,12 +50,10 @@ pub struct WaylandState {
 
     anchor: Anchor,
 
-    buffer: FrameBuffer,
-
-    memory_pool: Option<WlShmPool>,
+    color_format: ColorFormat,
+    frame_buffer: Option<FrameBuffer>,
 
     wl_surface: Option<WlSurface>,
-    wl_buffer: Option<WlBuffer>,
 
     layer_shell: Option<ZwlrLayerShellV1>,
     layer_surface: Option<ZwlrLayerSurfaceV1>,
@@ -58,6 +62,10 @@ pub struct WaylandState {
     pointer: Option<WlPointer>,
 
     configured: bool,
+
+    // TODO: Insert check through all constructor code
+    error: Option<ClunkyError>,
+    do_render: bool,
 }
 
 impl WaylandState {
@@ -91,13 +99,22 @@ impl WaylandState {
 
         wl_surface.commit();
     }
+
+    fn attach_buffer(&mut self) {
+        if self.error.is_some() || !self.configured {
+            return;
+        }
+        let surface = require_some!(&self.wl_surface);
+        let framebuffer = require_some!(&self.frame_buffer);
+        surface.attach(Some(framebuffer.buffer()), 0, 0);
+        surface.commit();
+    }
 }
 
 impl RenderTarget<EventQueue<Self>> for WaylandState {
-    fn create(
-        config: TargetConfig,
-        buffer: FrameBuffer,
-    ) -> crate::error::Result<(Self, EventQueue<Self>)> {
+    type QH = QueueHandle<Self>;
+
+    fn create(config: TargetConfig) -> Result<(Self, Connection, EventQueue<Self>), ClunkyError> {
         let connection =
             Connection::connect_to_env().map_err(|err| RenderError::WaylandConnect(err))?;
 
@@ -116,26 +133,31 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
                 size: config.size,
                 anchor: config.anchor,
 
-                buffer,
+                color_format: ColorFormat::RGBA8888,
+                frame_buffer: None,
 
-                memory_pool: None,
                 wl_surface: None,
-                wl_buffer: None,
                 layer_shell: None,
                 layer_surface: None,
                 keyboard: None,
                 pointer: None,
+
+                error: None,
+                do_render: false,
             },
             event_queue,
         );
 
-        while !state.configured {
+        while !state.configured && state.error.is_none() {
             queue
                 .blocking_dispatch(&mut state)
                 .map_err(RenderError::WaylandDispatch)?;
         }
 
-        Ok((state, queue))
+        match state.error {
+            Some(err) => Err(err),
+            None => Ok((state, connection, queue)),
+        }
     }
 
     fn reposition(&mut self, new_position: IVec2) -> crate::error::Result<()> {
@@ -151,54 +173,53 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
         Ok(())
     }
 
-    fn resize(&mut self, new_size: UVec2, qh: &QueueHandle<Self>) -> crate::error::Result<()> {
+    fn resize(&mut self, new_size: UVec2, qh: Self::QH) -> crate::error::Result<()> {
         log::info!("Resizing surface to: {}x{}", new_size.x, new_size.y);
         self.size = new_size;
-        self.buffer.ensure_capacity(new_size, 4);
-        let pool = self
-            .memory_pool
-            .as_mut()
-            .expect("shared memory pool not initialized");
-        pool.resize((new_size.x * new_size.y) as i32 * 4);
 
-        let mut buffer = Some(pool.create_buffer(
-            0,
-            new_size.x as i32,
-            new_size.y as i32,
-            (new_size.x * 4) as i32,
-            wl_shm::Format::Argb8888,
+        let frame_buffer = self.frame_buffer.as_mut().expect("buffer not initialized");
+        frame_buffer.switch_params(
+            FrameParameters {
+                dimensions: self.size,
+                format: self.color_format,
+            },
             qh,
-            (),
-        ));
+        )?;
 
-        if let Some(surface) = self.wl_surface.as_ref() {
-            surface.attach(buffer.as_ref(), 0, 0);
-            if self.buffer.set_owner(OwnerState::Compositor) {
-                panic!(
-                    "can't pass buffer ownership to compositor; owner is: {:?}",
-                    self.buffer.get_owner()
-                )
-            }
-            surface.commit();
-        }
-        std::mem::swap(&mut buffer, &mut self.wl_buffer);
-        if let Some(prev_buffer) = buffer {
-            prev_buffer.destroy();
-        }
+        self.attach_buffer();
 
         Ok(())
     }
 
-    fn buffer(&mut self) -> &mut FrameBuffer {
-        &mut self.buffer
+    fn push_frame(&mut self, qh: Self::QH) {
+        let surface = require_some!(&self.wl_surface);
+        surface.frame(&qh, CallbackKind::Frame);
+        self.do_render = false;
+        surface.commit();
     }
 
     fn destroy(&mut self) -> crate::error::Result<()> {
+        self.running = false;
         Ok(())
     }
 
-    fn active(&self) -> bool {
+    fn frame_parameters(&self) -> FrameParameters {
+        FrameParameters {
+            dimensions: self.size,
+            format: self.color_format,
+        }
+    }
+
+    fn buffer(&mut self) -> &mut FrameBuffer {
+        self.frame_buffer.as_mut().expect("buffer not initialized")
+    }
+
+    fn running(&self) -> bool {
         self.running
+    }
+
+    fn can_render(&self) -> bool {
+        self.do_render
     }
 }
 
@@ -216,6 +237,29 @@ fn position_to_margins(anchor: Anchor, position: IVec2) -> (i32, i32, i32, i32) 
     };
 
     (top, right, bottom, left)
+}
+
+impl Dispatch<wl_callback::WlCallback, CallbackKind> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        kind: &CallbackKind,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done {
+            callback_data: time,
+        } = event
+        {
+            log::info!("Frame complete");
+            match kind {
+                CallbackKind::Frame => {
+                    state.do_render = true;
+                }
+            }
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, ()> for WaylandState {
@@ -244,34 +288,24 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
                 "wl_shm" => {
                     let shm: wl_shm::WlShm = registry.bind(name, 1, qh, ());
 
-                    state.buffer.ensure_capacity(state.size, 4);
-                    let pool = shm.create_pool(
-                        state.buffer.as_fd(),
-                        (state.size.x * state.size.y * 4) as i32,
+                    let fb = FrameBuffer::new(
+                        &shm,
+                        FrameParameters {
+                            dimensions: state.size,
+                            format: state.color_format,
+                        },
                         qh,
-                        (),
                     );
-                    let buffer = pool.create_buffer(
-                        0,
-                        state.size.x as i32,
-                        state.size.y as i32,
-                        (state.size.x * 4) as i32,
-                        wl_shm::Format::Argb8888,
-                        qh,
-                        (),
-                    );
-                    state.wl_buffer = Some(buffer.clone());
 
-                    if state.configured {
-                        let surface = state.wl_surface.as_ref().unwrap();
-                        surface.attach(Some(&buffer), 0, 0);
-                        if state.buffer.set_owner(OwnerState::Compositor) {
-                            panic!("can't pass buffer ownership to compositor")
+                    state.frame_buffer = match fb {
+                        Ok(it) => Some(it),
+                        Err(err) => {
+                            state.error = Some(err.into());
+                            return;
                         }
-                        surface.commit();
-                    }
+                    };
 
-                    state.memory_pool = Some(pool);
+                    state.attach_buffer();
                 }
                 "wl_seat" => {
                     registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, ());
@@ -324,7 +358,30 @@ impl Dispatch<WlSurface, ()> for WaylandState {
     }
 }
 
-stub_listener!(wl_shm::WlShm);
+impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wl_shm::WlShm,
+        event: wl_shm::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_shm::Event::Format {
+                format: WEnum::Value(format),
+            } => {
+                if let Some(color_format) = ColorFormat::from_wl_format(format) {
+                    if color_format < state.color_format {
+                        state.color_format = color_format;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 stub_listener!(wl_shm_pool::WlShmPool);
 
 impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandState {
@@ -338,13 +395,10 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandState {
     ) {
         match event {
             wl_buffer::Event::Release => {
-                if state
-                    .wl_buffer
-                    .as_ref()
-                    .map(|it| it.id() == buffer.id())
-                    .unwrap_or_default()
-                {
-                    state.buffer.clear_owner(OwnerState::Compositor);
+                if let Some(fb) = &state.frame_buffer {
+                    if fb.buffer().id() == buffer.id() {
+                        log::info!("Buffer released");
+                    }
                 }
             }
             _ => {}
@@ -441,15 +495,11 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for WaylandState {
         match event {
             zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
                 proxy.ack_configure(serial);
-                state.configured = true;
-
                 let wl_surface = state.wl_surface.as_ref().unwrap();
                 wl_surface.commit();
+                state.configured = true;
 
-                if let Some(buffer) = &state.wl_buffer {
-                    wl_surface.attach(Some(buffer), 0, 0);
-                    wl_surface.commit();
-                }
+                state.attach_buffer();
             }
             zwlr_layer_surface_v1::Event::Closed => {
                 state.running = false;

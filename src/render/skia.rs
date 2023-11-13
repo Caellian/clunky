@@ -2,11 +2,11 @@ use std::{fs::File, io::Write};
 
 use glam::UVec2;
 use skia_safe::{
-    surfaces, AlphaType, Color, Color4f, ColorSpace, ImageInfo, Paint, PixelGeometry, Rect,
-    SurfaceProps, SurfacePropsFlags,
+    surfaces, AlphaType, Color, Color4f, ColorSpace, ColorType, ImageInfo, Paint, PixelGeometry,
+    Rect, SurfaceProps, SurfacePropsFlags,
 };
 
-use super::buffer::{FrameBuffer, FrameParameters, FrameRef};
+use super::buffer::{FrameBuffer, FrameParameters};
 
 /*
 #include <vector>
@@ -27,21 +27,16 @@ std::vector<char> raster_direct(int width, int height,
  */
 
 //https://skia.org/docs/user/api/skcanvas_creation/
-pub fn draw(
-    buffer: &mut FrameBuffer,
-    params: FrameParameters,
-) -> Result<FrameRef, crate::ClunkyError> {
-    let frame = buffer.allocate_frame(params)?;
-
-    let info = frame.info();
-    let size = info.dimensions();
+pub fn draw(buffer: &mut FrameBuffer, params: FrameParameters) -> Result<(), crate::ClunkyError> {
+    let size = params.dimensions;
 
     let info =
-        ImageInfo::new_n32_premul((size.x as i32, size.y as i32), Some(ColorSpace::new_srgb()));
+        ImageInfo::new_n32_premul((size.x as i32, size.y as i32), Some(ColorSpace::new_srgb()))
+            .with_color_type(ColorType::RGBA8888);
     let props = SurfaceProps::new(SurfacePropsFlags::empty(), PixelGeometry::RGBH);
     let mut surface = surfaces::wrap_pixels(
         &info,
-        frame.as_mut_slice(),
+        buffer.as_mut_slice(),
         Some(size.x as usize * 4),
         Some(&props),
     )
@@ -63,5 +58,5 @@ pub fn draw(
     );
     canvas.draw_circle((50, 50), 50.0, &paint);
 
-    Ok(frame)
+    Ok(())
 }

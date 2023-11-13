@@ -1,5 +1,5 @@
 settings = {
-    a: "test"
+    framerate = 2,
 }
 
 function layout()

@@ -26,18 +26,6 @@ pub mod script;
 pub mod settings;
 pub mod util;
 
-mod fb {
-    use crate::render::buffer::FrameBuffer;
-    use std::sync::OnceLock;
-
-    static FRAMEBUFFER: OnceLock<FrameBuffer> = OnceLock::new();
-
-    pub fn framebuffer() -> &'static FrameBuffer {
-        FRAMEBUFFER.get_or_init(|| FrameBuffer::new())
-    }
-}
-pub use fb::framebuffer;
-
 fn main() {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
 
@@ -62,36 +50,49 @@ fn main() {
         Ok(()) => {}
     }
 
-    let buffer = FrameBuffer::new();
-
     let max_w = 1920;
     let max_h = 1050;
 
-    let (mut target, mut queue) = RenderTargetImpl::create(
-        TargetConfig {
-            position: IVec2::new(0, 0),
-            size: UVec2::new(max_w, max_h),
-            ..Default::default()
-        },
-        buffer,
-    )
+    let (mut target, mut conn, mut queue) = RenderTargetImpl::create(TargetConfig {
+        position: IVec2::new(0, 0),
+        size: UVec2::new(max_w, max_h),
+        ..Default::default()
+    })
     .expect("unable to create a render target");
+
+    let params = target.frame_parameters();
+    draw(target.buffer(), params).unwrap();
+    target.push_frame(queue.handle());
 
     // https://gafferongames.com/post/fix_your_timestep/
     let initial = Instant::now();
     let mut prev = initial;
-    while target.active() {
+    while target.running() {
         let current = Instant::now();
-        log::info!("frame time: {}ms", (current - prev).as_millis());
+        log::debug!("frame time: {}ms", (current - prev).as_millis());
         prev = current;
-        let offset = ((current - initial).as_secs() as f32).sin() / 2.0 + 0.5;
+        let offset = (((current - initial).as_millis() as f32 / 1000.0).sin() + 1.2) / 2.5;
 
-        queue.dispatch_pending(&mut target).unwrap();
-        draw(target.buffer());
-        let _ = queue.flush();
+        queue.blocking_dispatch(&mut target).unwrap();
+        //let _ = queue.flush();
+        //conn.prepare_read()
+
+        if target.can_render() {
+            let params = target.frame_parameters();
+            draw(target.buffer(), params).unwrap();
+            target.push_frame(queue.handle());
+        } else {
+            sleep(Duration::from_millis(1));
+        }
 
         target
-            .resize(UVec2::new(max_w / 2, max_h / 2), &queue.handle())
+            .resize(
+                UVec2::new(
+                    (max_w as f32 * offset) as u32,
+                    (max_h as f32 * offset) as u32,
+                ),
+                queue.handle(),
+            )
             .unwrap();
     }
 }
