@@ -135,3 +135,6 @@ fabric.properties
 
 !.idea/codeStyles
 !.idea/runConfigurations
+
+# References
+ref/

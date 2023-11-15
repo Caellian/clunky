@@ -10,33 +10,52 @@ use clap::Parser;
 use env_logger::Env;
 use error::ClunkyError;
 use glam::{IVec2, UVec2};
-use layout::Layout;
 use math::rect::Rect;
 use render::{skia::draw, RenderTarget, RenderTargetImpl, TargetConfig};
+use rlua::Function;
+use settings::Settings;
 
-use crate::{render::buffer::FrameBuffer, script::Context};
+use crate::{render::buffer::FrameBuffer, script::ScriptContext};
 
 mod args;
-pub mod component;
 pub mod error;
-pub mod layout;
 pub mod math;
 pub mod render;
 pub mod script;
 pub mod settings;
+pub mod skia_bindings;
 pub mod util;
+
+fn draw_frame<Q, T: RenderTarget<Q>>(
+    target: &mut T,
+    qh: T::QH,
+    script: &ScriptContext,
+    settings: &Settings,
+) {
+    if let Some(bg) = &settings.background {
+        let params = target.frame_parameters();
+        script
+            .lua()
+            .context(|l| {
+                let render_fn: Function = l.registry_value(bg)?;
+                draw(target.buffer(), params, render_fn)?;
+                Ok::<_, ClunkyError>(())
+            })
+            .expect("unable to draw frame");
+        target.push_frame(qh);
+    }
+}
 
 fn main() {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
 
     let args = Arguments::parse();
 
-    let mut layout = Layout::new();
-    let c = Context::new(args.script).expect("unable to load lua context");
+    let script = ScriptContext::new(args.script).expect("unable to load lua context");
 
-    let settings = c.load_settings();
-    log::info!("Target framerate: {}fps", settings.framerate);
+    let settings = script.load_settings();
 
+    /*
     match c.update_layout(&mut layout) {
         Err(err) => {
             match err {
@@ -48,7 +67,7 @@ fn main() {
             exit(1);
         }
         Ok(()) => {}
-    }
+    } */
 
     let max_w = 1920;
     let max_h = 1050;
@@ -60,9 +79,7 @@ fn main() {
     })
     .expect("unable to create a render target");
 
-    let params = target.frame_parameters();
-    draw(target.buffer(), params).unwrap();
-    target.push_frame(queue.handle());
+    draw_frame(&mut target, queue.handle(), &script, &settings);
 
     // https://gafferongames.com/post/fix_your_timestep/
     let initial = Instant::now();
@@ -78,21 +95,9 @@ fn main() {
         //conn.prepare_read()
 
         if target.can_render() {
-            let params = target.frame_parameters();
-            draw(target.buffer(), params).unwrap();
-            target.push_frame(queue.handle());
+            draw_frame(&mut target, queue.handle(), &script, &settings);
         } else {
             sleep(Duration::from_millis(1));
         }
-
-        target
-            .resize(
-                UVec2::new(
-                    (max_w as f32 * offset) as u32,
-                    (max_h as f32 * offset) as u32,
-                ),
-                queue.handle(),
-            )
-            .unwrap();
     }
 }

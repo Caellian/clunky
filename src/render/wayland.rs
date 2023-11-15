@@ -133,7 +133,7 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
                 size: config.size,
                 anchor: config.anchor,
 
-                color_format: ColorFormat::RGBA8888,
+                color_format: ColorFormat::ARGB8888,
                 frame_buffer: None,
 
                 wl_surface: None,
@@ -371,6 +371,7 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
             wl_shm::Event::Format {
                 format: WEnum::Value(format),
             } => {
+                log::info!("FORMAT: {:?}", format);
                 if let Some(color_format) = ColorFormat::from_wl_format(format) {
                     if color_format < state.color_format {
                         state.color_format = color_format;

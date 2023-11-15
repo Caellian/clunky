@@ -23,13 +23,13 @@ use super::wayland::WaylandState;
 #[non_exhaustive]
 #[repr(u8)]
 pub enum ColorFormat {
-    RGBA8888,
+    ARGB8888,
 }
 
 impl ColorFormat {
     pub const fn from_wl_format(format: WlFormat) -> Option<Self> {
         match format {
-            WlFormat::Rgba8888 => Some(ColorFormat::RGBA8888),
+            WlFormat::Rgba8888 => Some(ColorFormat::ARGB8888),
             _ => None,
         }
     }
@@ -37,7 +37,7 @@ impl ColorFormat {
     #[allow(unreachable_patterns)]
     pub fn as_wl_format(&self) -> WlFormat {
         match self {
-            ColorFormat::RGBA8888 => WlFormat::Argb8888,
+            ColorFormat::ARGB8888 => WlFormat::Argb8888,
             _ => unreachable!("frame color format not supported by Wayland"),
         }
     }
@@ -45,14 +45,14 @@ impl ColorFormat {
     #[allow(unreachable_patterns)]
     pub fn as_skia_format(&self) -> ColorType {
         match self {
-            ColorFormat::RGBA8888 => ColorType::RGBA8888,
+            ColorFormat::ARGB8888 => ColorType::BGRA8888,
             _ => unreachable!("frame color format not supported by Skia"),
         }
     }
 
     pub fn pixel_size(&self) -> usize {
         match self {
-            ColorFormat::RGBA8888 => 4,
+            ColorFormat::ARGB8888 => 4,
         }
     }
 }

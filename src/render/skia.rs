@@ -1,62 +1,54 @@
-use std::{fs::File, io::Write};
+use std::{fs::File, io::Write, ptr::addr_of};
 
 use glam::UVec2;
+use rlua::Function as LuaFunction;
 use skia_safe::{
     surfaces, AlphaType, Color, Color4f, ColorSpace, ColorType, ImageInfo, Paint, PixelGeometry,
     Rect, SurfaceProps, SurfacePropsFlags,
 };
 
+use crate::skia_bindings::LuaSkCanvas;
+
 use super::buffer::{FrameBuffer, FrameParameters};
 
-/*
-#include <vector>
-#include "include/core/SkSurface.h"
-std::vector<char> raster_direct(int width, int height,
-                                void (*draw)(SkCanvas*)) {
-    SkImageInfo info = SkImageInfo::MakeN32Premul(width, height);
-    size_t rowBytes = info.minRowBytes();
-    size_t size = info.getSafeSize(rowBytes);
-    std::vector<char> pixelMemory(size);  // allocate memory
-    sk_sp<SkSurface> surface =
-            SkSurface::MakeRasterDirect(
-                    info, &pixelMemory[0], rowBytes);
-    SkCanvas* canvas = surface->getCanvas();
-    draw(canvas);
-    return pixelMemory;
+fn reorder_rgba_to_argb(over: &mut [u8]) {
+    assert!(over.len() % 4 == 0);
+    let over_cast =
+        unsafe { std::slice::from_raw_parts_mut(over.as_mut_ptr() as *mut u32, over.len() >> 2) };
+    for pixel in over_cast {
+        let a = (*pixel & 0xff) << 3;
+        *pixel = (*pixel >> 1) | a;
+    }
 }
- */
 
 //https://skia.org/docs/user/api/skcanvas_creation/
-pub fn draw(buffer: &mut FrameBuffer, params: FrameParameters) -> Result<(), crate::ClunkyError> {
+pub fn draw(
+    buffer: &mut FrameBuffer,
+    params: FrameParameters,
+    script_fn: LuaFunction,
+) -> Result<(), crate::ClunkyError> {
     let size = params.dimensions;
 
     let info =
         ImageInfo::new_n32_premul((size.x as i32, size.y as i32), Some(ColorSpace::new_srgb()))
-            .with_color_type(ColorType::RGBA8888);
-    let props = SurfaceProps::new(SurfacePropsFlags::empty(), PixelGeometry::RGBH);
+            .with_color_type(ColorType::BGRA8888);
+
     let mut surface = surfaces::wrap_pixels(
         &info,
         buffer.as_mut_slice(),
         Some(size.x as usize * 4),
-        Some(&props),
+        None,
     )
     .unwrap();
-    let canvas = surface.canvas();
 
-    let color = Color4f::new(0.8, 0.2, 0.7, 1.0);
-    let paint = Paint::new(color, &ColorSpace::new_srgb());
-    canvas.clear(Color::TRANSPARENT);
+    let canvas = unsafe {
+        // FIXME: Canvas will outlive script_fn call
+        addr_of!(*surface.canvas()).as_ref().unwrap_unchecked()
+    };
 
-    canvas.draw_rect(
-        Rect {
-            left: 0.0,
-            top: 0.0,
-            right: size.x as f32,
-            bottom: size.y as f32,
-        },
-        &paint,
-    );
-    canvas.draw_circle((50, 50), 50.0, &paint);
+    script_fn
+        .call(LuaSkCanvas(canvas))
+        .map_err(crate::error::ClunkyError::Lua)?;
 
     Ok(())
 }
