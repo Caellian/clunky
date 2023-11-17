@@ -1,0 +1,1 @@
+Windows icon font: Segoe UI

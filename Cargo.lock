@@ -1031,6 +1031,7 @@ dependencies = [
  "libc",
  "num-traits",
  "rlua-lua51-sys",
+ "rlua-lua54-sys",
 ]
 
 [[package]]
@@ -1038,6 +1039,17 @@ name = "rlua-lua51-sys"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c8f4636b03fa54b5c154415f1d9333cec7a7e3bd6bc64c092a2196e488cfd52"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
+name = "rlua-lua54-sys"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7aafabafe1895cb4a2be81a56d7ff3d46bf4b5d2f9cfdbea2ed404cdabe96474"
 dependencies = [
  "cc",
  "libc",

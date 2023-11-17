@@ -72,7 +72,7 @@ fn main() {
     let max_w = 1920;
     let max_h = 1050;
 
-    let (mut target, mut conn, mut queue) = RenderTargetImpl::create(TargetConfig {
+    let (mut target, _, mut queue) = RenderTargetImpl::create(TargetConfig {
         position: IVec2::new(0, 0),
         size: UVec2::new(max_w, max_h),
         ..Default::default()

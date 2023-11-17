@@ -7,7 +7,7 @@ use skia_safe::{
     Rect, SurfaceProps, SurfacePropsFlags,
 };
 
-use crate::skia_bindings::LuaSkCanvas;
+use crate::skia_bindings::LuaCanvas;
 
 use super::buffer::{FrameBuffer, FrameParameters};
 
@@ -47,7 +47,7 @@ pub fn draw(
     };
 
     script_fn
-        .call(LuaSkCanvas(canvas))
+        .call(LuaCanvas(canvas))
         .map_err(crate::error::ClunkyError::Lua)?;
 
     Ok(())

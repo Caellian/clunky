@@ -248,11 +248,7 @@ impl Dispatch<wl_callback::WlCallback, CallbackKind> for WaylandState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done {
-            callback_data: time,
-        } = event
-        {
-            log::info!("Frame complete");
+        if let wl_callback::Event::Done { .. } = event {
             match kind {
                 CallbackKind::Frame => {
                     state.do_render = true;
