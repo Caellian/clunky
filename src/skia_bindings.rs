@@ -6,7 +6,6 @@ use std::{
 
 use phf::phf_map;
 use rlua::{prelude::*, Context as LuaContext, Table as LuaTable, UserData, Variadic};
-use skia_bindings::SkApplyPerspectiveClip;
 use skia_safe::{
     canvas::{self, SaveLayerFlags, SaveLayerRec},
     font_style::{Slant, Weight, Width},
@@ -458,10 +457,29 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
 impl<'lua, const N: usize> ToLua<'lua> for LuaPoint<N> {
     fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
         let result = lua.create_table()?;
+
         for (i, coord) in COORD_NAME[0..N].iter().enumerate() {
             result.set(*coord, self.value[i])?;
         }
-        Ok(result.to_lua(lua)?)
+
+        result.to_lua(lua)
+    }
+}
+
+#[derive(Clone)]
+pub struct LuaLine<const N: usize> {
+    pub from: LuaPoint<N>,
+    pub to: LuaPoint<N>,
+}
+
+impl<'lua, const N: usize> ToLua<'lua> for LuaLine<N> {
+    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+        let result = lua.create_table()?;
+
+        result.set("from", self.from.to_lua(lua)?)?;
+        result.set("to", self.to.to_lua(lua)?)?;
+
+        result.to_lua(lua)
     }
 }
 
@@ -1219,7 +1237,16 @@ impl UserData for LuaPath {
         methods.add_method("isLastContourClosed", |_, this, ()| {
             Ok(this.is_last_contour_closed())
         });
-        methods.add_method("isLine", |_, this, ()| Ok(this.is_line().is_some()));
+        methods.add_method("isLine", |ctx, this, ()| {
+            Ok(match this.is_line() {
+                Some((from, to)) => LuaLine {
+                    from: LuaPoint::from(from),
+                    to: LuaPoint::from(to),
+                }
+                .to_lua(ctx),
+                None => Ok(LuaNil),
+            })
+        });
         methods.add_method("isOval", |ctx, this, ()| {
             Ok(match this.is_oval() {
                 Some(oval) => write_rect_table(oval, ctx)?.to_lua(ctx)?,
@@ -1232,7 +1259,12 @@ impl UserData for LuaPath {
                 None => LuaNil,
             })
         });
-        methods.add_method("isRRect", |_, this, ()| Ok(this.is_rrect().is_some()));
+        methods.add_method("isRRect", |ctx, this, ()| {
+            Ok(match this.is_rrect() {
+                Some(rrect) => LuaRRect(rrect).to_lua(ctx),
+                None => Ok(LuaNil),
+            })
+        });
         methods.add_method("isValid", |_, this, ()| Ok(this.is_valid()));
         methods.add_method("isVolatile", |_, this, ()| Ok(this.is_volatile()));
         methods.add_method_mut("lineTo", |_, this, point: LuaPoint| {
@@ -1620,7 +1652,7 @@ unsafe impl<'a> Send for LuaCanvas<'a> {}
 impl<'a> std::ops::Deref for LuaCanvas<'a> {
     type Target = &'a Canvas;
     fn deref(&self) -> &Self::Target {
-        &self
+        &self.0
     }
 }
 
