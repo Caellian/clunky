@@ -1,4 +1,5 @@
 use std::{
+    error::Error,
     mem::MaybeUninit,
     process::exit,
     thread::sleep,
@@ -34,14 +35,20 @@ fn draw_frame<Q, T: RenderTarget<Q>>(
 ) {
     if let Some(bg) = &settings.background {
         let params = target.frame_parameters();
-        script
-            .lua()
-            .context(|l| {
-                let render_fn: Function = l.registry_value(bg)?;
-                draw(target.buffer(), params, render_fn)?;
-                Ok::<_, ClunkyError>(())
-            })
-            .expect("unable to draw frame");
+        let result = script.lua().context(|l| {
+            let render_fn: Function = l.registry_value(bg)?;
+            draw(target.buffer(), params, render_fn)?;
+            Ok::<_, ClunkyError>(())
+        });
+
+        if let Err(err) = result {
+            log::error!("{}", err);
+            if let Some(source) = err.source() {
+                log::error!("{}", source);
+            }
+            exit(1);
+        }
+
         target.push_frame(qh);
     }
 }

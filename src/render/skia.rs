@@ -52,3 +52,41 @@ pub fn draw(
 
     Ok(())
 }
+
+pub mod ext {
+    use std::ptr::{addr_of, addr_of_mut};
+
+    use skia_safe::{Matrix, M44};
+
+    #[inline]
+    pub fn matrix_as_slice(mx: &Matrix) -> &[f32; 9] {
+        unsafe { (addr_of!(*mx) as *mut [f32; 9]).as_ref().unwrap_unchecked() }
+    }
+
+    #[inline]
+    pub fn matrix_as_slice_mut(mx: &mut Matrix) -> &mut [f32; 9] {
+        unsafe {
+            (addr_of_mut!(*mx) as *mut [f32; 9])
+                .as_mut()
+                .unwrap_unchecked()
+        }
+    }
+
+    #[inline]
+    pub fn m44_as_slice(mx: &M44) -> &[f32; 16] {
+        unsafe {
+            (addr_of!(*mx) as *mut [f32; 16])
+                .as_ref()
+                .unwrap_unchecked()
+        }
+    }
+
+    #[inline]
+    pub fn m44_as_slice_mut(mx: &mut M44) -> &mut [f32; 16] {
+        unsafe {
+            (addr_of_mut!(*mx) as *mut [f32; 16])
+                .as_mut()
+                .unwrap_unchecked()
+        }
+    }
+}

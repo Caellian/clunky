@@ -1,0 +1,4 @@
+[submodule "vendored/rlua"]
+	path = vendored/rlua
+	url = git@github.com:Caellian/rlua.git
+	branch = feature/multi-stacking
