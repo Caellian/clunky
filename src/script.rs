@@ -63,7 +63,7 @@ impl ScriptContext {
                     .expect(&format!("user script has no {} function", LAYOUT_FN));
                 Ok(lua_ctx.create_registry_value(layout_fn)?)
             */
-            crate::skia_bindings::setup(lua_ctx)?;
+            crate::render::frontend::bindings::setup(lua_ctx)?;
             Ok(())
         })?;
 

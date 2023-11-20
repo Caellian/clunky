@@ -24,7 +24,6 @@ pub mod math;
 pub mod render;
 pub mod script;
 pub mod settings;
-pub mod skia_bindings;
 pub mod util;
 
 fn draw_frame<Q, T: RenderTarget<Q>>(

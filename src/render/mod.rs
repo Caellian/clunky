@@ -4,6 +4,8 @@ pub mod wayland;
 pub mod buffer;
 pub mod skia;
 
+pub use skia as frontend;
+
 use glam::{IVec2, UVec2};
 use parking_lot::Condvar;
 use wayland_client::{Connection, QueueHandle};

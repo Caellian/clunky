@@ -1,13 +1,9 @@
-use std::{fs::File, io::Write, ptr::addr_of};
+use std::ptr::addr_of;
 
-use glam::UVec2;
 use rlua::Function as LuaFunction;
-use skia_safe::{
-    surfaces, AlphaType, Color, Color4f, ColorSpace, ColorType, ImageInfo, Paint, PixelGeometry,
-    Rect, SurfaceProps, SurfacePropsFlags,
-};
+use skia_safe::{surfaces, ColorSpace, ColorType, ImageInfo};
 
-use crate::skia_bindings::LuaCanvas;
+use bindings::LuaCanvas;
 
 use super::buffer::{FrameBuffer, FrameParameters};
 
@@ -90,3 +86,5 @@ pub mod ext {
         }
     }
 }
+#[path = "skia_bindings.rs"]
+pub mod bindings;
