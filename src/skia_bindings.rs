@@ -362,10 +362,10 @@ impl<'lua> FromLua<'lua> for LuaColor {
         match len {
             0 => Ok(LuaColor::default()),
             3 | 4 => {
-                let r = color.get(0).map_err(|_| unknown_format())?;
-                let g = color.get(1).map_err(|_| unknown_format())?;
-                let b = color.get(2).map_err(|_| unknown_format())?;
-                let a = color.get(3).unwrap_or(1.);
+                let r = color.get(0 as i64).map_err(|_| unknown_format())?;
+                let g = color.get(1 as i64).map_err(|_| unknown_format())?;
+                let b = color.get(2 as i64).map_err(|_| unknown_format())?;
+                let a = color.get(3 as i64).unwrap_or(1.);
                 Ok(LuaColor { r, g, b, a })
             }
             _ => Err(unknown_format()),
@@ -605,7 +605,7 @@ impl Into<ISize> for LuaSize {
 impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaSize<N> {
     fn from_lua_multi(
         values: LuaMultiValue<'lua>,
-        lua: LuaContext<'lua>,
+        _: LuaContext<'lua>,
         consumed: &mut usize,
     ) -> LuaResult<Self> {
         if values.is_empty() {
@@ -740,7 +740,7 @@ impl<'lua, const N: usize> TryFrom<LuaTable<'lua>> for LuaSize<N> {
         } else {
             let len = table
                 .clone()
-                .pairs::<usize, f32>()
+                .sequence_values::<f32>()
                 .filter(|it| it.is_ok())
                 .count();
             if len != N {
@@ -752,8 +752,8 @@ impl<'lua, const N: usize> TryFrom<LuaTable<'lua>> for LuaSize<N> {
             }
 
             let mut value = [0.0; N];
-            for (i, value) in value.iter_mut().enumerate() {
-                *value = table.get(i).map_err(bad_table_entries::<N>)?;
+            for (value, entry) in value.iter_mut().zip(table.sequence_values::<f32>()) {
+                *value = entry.map_err(bad_table_entries::<N>)?;
             }
             Ok(LuaSize { value })
         }
@@ -949,7 +949,7 @@ impl<'lua, const N: usize> TryFrom<LuaTable<'lua>> for LuaPoint<N> {
         } else {
             let len = table
                 .clone()
-                .pairs::<usize, f32>()
+                .sequence_values::<f32>()
                 .filter(|it| it.is_ok())
                 .count();
             if len != N {
@@ -961,8 +961,8 @@ impl<'lua, const N: usize> TryFrom<LuaTable<'lua>> for LuaPoint<N> {
             }
 
             let mut value = [0.0; N];
-            for (i, value) in value.iter_mut().enumerate() {
-                *value = table.get(i).map_err(bad_table_entries::<N>)?;
+            for (value, entry) in value.iter_mut().zip(table.sequence_values::<f32>()) {
+                *value = entry.map_err(bad_table_entries::<N>)?;
             }
             Ok(LuaPoint { value })
         }
@@ -1030,6 +1030,12 @@ macro_rules! wrap_skia_handle {
                     &self.0
                 }
             }
+
+            impl [<Lua $handle>] {
+                pub fn unwrap(self) -> $handle {
+                    self.0
+                }
+            }
         }
     };
 }
@@ -1044,6 +1050,13 @@ macro_rules! type_like_table {
             }
             #[derive(Clone)]
             pub struct [<Like $handle>]([<Lua $handle>]);
+
+            impl [<Like $handle>] {
+                pub fn unwrap(self) -> $handle {
+                    self.0.unwrap()
+                }
+            }
+
             impl Into<[<Lua $handle>]> for [<Like $handle>] {
                 fn into(self) -> [<Lua $handle>] {
                     self.0
@@ -1227,14 +1240,14 @@ impl UserData for LuaColorFilter {
                         Ok(LuaColor::from(this.filter_color4f(
                             &color,
                             &src_cs,
-                            dst_cs.map(|it| it.0).as_ref(),
+                            dst_cs.map(LuaColorSpace::unwrap).as_ref(),
                         )))
                     }
                 }
             },
         );
         methods.add_method("makeComposed", |_, this, inner: LuaColorFilter| {
-            Ok(LuaColorFilter(this.composed(inner.0).ok_or(
+            Ok(LuaColorFilter(this.composed(inner.unwrap()).ok_or(
                 LuaError::RuntimeError("unable to compose filters".to_string()),
             )?))
         });
@@ -1242,10 +1255,9 @@ impl UserData for LuaColorFilter {
             "makeWithWorkingColorSpace",
             |_, this, color_space: LuaColorSpace| {
                 Ok(LuaColorFilter(
-                    this.with_working_color_space(color_space.0)
-                        .ok_or(LuaError::RuntimeError(
-                            "unable to apply color space to filter".to_string(),
-                        ))?,
+                    this.with_working_color_space(color_space.unwrap()).ok_or(
+                        LuaError::RuntimeError("unable to apply color space to filter".to_string()),
+                    )?,
                 ))
             },
         );
@@ -1352,8 +1364,8 @@ impl UserData for LuaPathEffect {
                 Option<LuaMatrix>,
             )| {
                 let cull_rect: Rect = cull_rect.into();
-                let mut dst = src.0.clone();
-                let mut stroke_rec = stroke_rec.0;
+                let mut dst = Path::new();
+                let mut stroke_rec = stroke_rec.unwrap();
                 match ctm {
                     None => match this.filter_path(&src, &stroke_rec, cull_rect) {
                         Some((new_dst, new_stroke_rec)) => {
@@ -1696,19 +1708,67 @@ impl UserData for LuaMatrix {
 wrap_skia_handle!(Paint);
 
 type_like_table!(Paint: |value: LuaTable, ctx: LuaContext| {
-    if let Ok(color) = LuaColor::from_lua(LuaValue::Table(value), ctx) {
+    let mut paint = Paint::default();
+
+    let color_space = value.get::<_, LuaColorSpace>("color_space").ok().map(LuaColorSpace::unwrap);
+    if let Ok(color) = LuaColor::from_lua(LuaValue::Table(value.clone()), ctx) {
         let color: Color4f = color.into();
-        let result = Paint::new(color, None);
-        return Ok(LuaPaint(result))
+        paint.set_color4f(color, color_space.as_ref());
     }
 
-    // TODO: Add nested Color->Paint constructor that takes in ColorSpace
+    if let Some(aa) = value.get::<_, bool>("anti_alias").ok() {
+        paint.set_anti_alias(aa);
+    }
 
-    Err(LuaError::ToLuaConversionError {
-        from: "table",
-        to: "Paint",
-        message: Some("expected a Paint or Paint-like Table".to_string())
-    })
+    if let Some(dither) = value.get::<_, bool>("dither").ok() {
+        paint.set_dither(dither);
+    }
+
+    if let Some(image_filter) = value.get::<_, LuaImageFilter>("image_filter").ok() {
+        paint.set_image_filter(image_filter.unwrap());
+    }
+    if let Some(mask_filter) = value.get::<_, LuaMaskFilter>("mask_filter").ok() {
+        paint.set_mask_filter(mask_filter.unwrap());
+    }
+    if let Some(color_filter) = value.get::<_, LuaColorFilter>("color_filter").ok() {
+        paint.set_color_filter(color_filter.unwrap());
+    }
+
+    if let Some(style) = value.get::<_, LuaTable>("style").ok() {
+        let fill: bool = style.get("fill").unwrap_or_default();
+        let stroke: bool = style.get("stroke").unwrap_or_default();
+        paint.set_style(match (fill, stroke) {
+            (true, false) => skia_safe::paint::Style::Fill,
+            (false, true) => skia_safe::paint::Style::Stroke,
+            (true, true) => skia_safe::paint::Style::StrokeAndFill,
+            (false, false) => {
+                return Err(LuaError::RuntimeError(
+                    "invalid paint style; neither 'fill' nor 'stroke' is true".to_string(),
+                ))
+            }
+        });
+    }
+    if let Some(cap) = value.get::<_, String>("stroke_cap").or(value.get::<_, String>("cap")).ok() {
+        paint.set_stroke_cap(read_paint_cap(cap)?);
+    }
+    if let Some(join) = value.get::<_, String>("stroke_join").or(value.get::<_, String>("join")).ok() {
+        paint.set_stroke_join(read_paint_join(join)?);
+    }
+    if let Some(width) = value.get::<_, f32>("stroke_width").or(value.get::<_, f32>("width")).ok() {
+        paint.set_stroke_width(width);
+    }
+    if let Some(miter) = value.get::<_, f32>("stroke_miter").or(value.get::<_, f32>("miter")).ok() {
+        paint.set_stroke_miter(miter);
+    }
+    if let Some(path_effect) = value.get::<_, LuaPathEffect>("path_effect").ok() {
+        paint.set_path_effect(path_effect.unwrap());
+    }
+
+    if let Some(shader) = value.get::<_, LuaShader>("shader").ok() {
+        paint.set_shader(Some(shader.unwrap()));
+    }
+
+    return Ok(LuaPaint(paint))
 });
 
 impl UserData for LuaPaint {
@@ -1729,7 +1789,7 @@ impl UserData for LuaPaint {
         methods.add_method_mut(
             "setImageFilter",
             |_, this, image_filter: Option<LuaImageFilter>| {
-                this.set_image_filter(image_filter.map(|it| it.0));
+                this.set_image_filter(image_filter.map(LuaImageFilter::unwrap));
                 Ok(())
             },
         );
@@ -1739,7 +1799,7 @@ impl UserData for LuaPaint {
         methods.add_method_mut(
             "setMaskFilter",
             |_, this, mask_filter: Option<LuaMaskFilter>| {
-                this.set_mask_filter(mask_filter.map(|it| it.0));
+                this.set_mask_filter(mask_filter.map(LuaMaskFilter::unwrap));
                 Ok(())
             },
         );
@@ -1749,7 +1809,7 @@ impl UserData for LuaPaint {
         methods.add_method_mut(
             "setColorFilter",
             |_, this, color_filter: Option<LuaColorFilter>| {
-                this.set_color_filter(color_filter.map(|it| it.0));
+                this.set_color_filter(color_filter.map(LuaColorFilter::unwrap));
                 Ok(())
             },
         );
@@ -1763,7 +1823,7 @@ impl UserData for LuaPaint {
             "setColor",
             |_, this, (color, color_space): (LuaColor, Option<LuaColorSpace>)| {
                 let color: Color4f = color.into();
-                this.set_color4f(color, color_space.map(|it| it.0).as_ref());
+                this.set_color4f(color, color_space.map(LuaColorSpace::unwrap).as_ref());
                 Ok(())
             },
         );
@@ -1828,44 +1888,14 @@ impl UserData for LuaPaint {
             Ok(this.path_effect().map(LuaPathEffect))
         });
         methods.add_method_mut("getPathEffect", |_, this, effect: Option<LuaPathEffect>| {
-            this.set_path_effect(effect.map(|it| it.0));
+            this.set_path_effect(effect.map(LuaPathEffect::unwrap));
             Ok(())
         });
-        methods.add_method("getColorFilter", |_, this, ()| {
-            Ok(this.color_filter().map(LuaColorFilter))
-        });
-        methods.add_method_mut(
-            "setColorFilter",
-            |_, this, color_filter: Option<LuaColorFilter>| {
-                this.set_color_filter(color_filter.map(|it| it.0));
-                Ok(())
-            },
-        );
-        methods.add_method("getImageFilter", |_, this, ()| {
-            Ok(this.image_filter().map(LuaImageFilter))
-        });
-        methods.add_method_mut(
-            "setImageFilter",
-            |_, this, image_filter: Option<LuaImageFilter>| {
-                this.set_image_filter(image_filter.map(|it| it.0));
-                Ok(())
-            },
-        );
         methods.add_method("getShader", |_, this, ()| Ok(this.shader().map(LuaShader)));
         methods.add_method_mut("setShader", |_, this, shader: Option<LuaShader>| {
-            this.set_shader(shader.map(|it| it.0));
+            this.set_shader(shader.map(LuaShader::unwrap));
             Ok(())
         });
-        methods.add_method("getPathEffect", |_, this, ()| {
-            Ok(this.path_effect().map(LuaPathEffect))
-        });
-        methods.add_method_mut(
-            "setPathEffect",
-            |_, this, path_effect: Option<LuaPathEffect>| {
-                this.set_path_effect(path_effect.map(|it| it.0));
-                Ok(())
-            },
-        );
     }
 }
 
@@ -1957,7 +1987,7 @@ impl UserData for LuaPath {
                     None => PathDirection::CW,
                 };
                 let start = start.unwrap_or(1);
-                this.add_rrect(rrect.0, Some((dir, start)));
+                this.add_rrect(rrect.unwrap(), Some((dir, start)));
                 Ok(())
             },
         );
@@ -2208,7 +2238,7 @@ type_like_table!(ImageInfo: |value: LuaTable| {
     let color_space = value
         .get::<_, LuaColorSpace>("color_space")
         .ok()
-        .map(|it| it.0);
+        .map(LuaColorSpace::unwrap);
 
     let result = ImageInfo::new(dimensions, color_type, alpha_type, color_space);
 
@@ -2408,7 +2438,7 @@ impl UserData for LuaTextBlob {
             "getIntercepts",
             |_, this, (bounds, paint): (LuaPoint, Option<LikePaint>)| {
                 let bounds = bounds.value;
-                Ok(this.get_intercepts(bounds, paint.map(|it| it.0 .0).as_ref()))
+                Ok(this.get_intercepts(bounds, paint.map(LikePaint::unwrap).as_ref()))
             },
         );
     }
@@ -2567,7 +2597,7 @@ impl<'a> UserData for LuaCanvas<'a> {
         methods.add_method(
             "drawImage",
             |_, this, (image, point, paint): (LuaImage, LuaPoint, Option<LikePaint>)| {
-                this.draw_image(image.0, point, paint.map(|it| it.0 .0).as_ref());
+                this.draw_image(image.unwrap(), point, paint.map(LikePaint::unwrap).as_ref());
                 Ok(())
             },
         );
@@ -2582,7 +2612,7 @@ impl<'a> UserData for LuaCanvas<'a> {
                 Option<LikePaint>,
             )| {
                 let paint: Paint = match paint {
-                    Some(it) => it.0 .0,
+                    Some(it) => it.unwrap(),
                     None => Paint::default(),
                 };
                 let src_rect = match src_rect {
@@ -2591,7 +2621,7 @@ impl<'a> UserData for LuaCanvas<'a> {
                 };
                 let dst_rect: Rect = dst_rect.into();
                 this.draw_image_rect(
-                    image.0,
+                    image.unwrap(),
                     src_rect
                         .as_ref()
                         .map(|rect| (rect, canvas::SrcRectConstraint::Fast)),
@@ -2619,8 +2649,8 @@ impl<'a> UserData for LuaCanvas<'a> {
                 }
                 let mut cubics = [Point::new(0.0, 0.0); 12];
                 for i in 0..12 {
-                    let x: f32 = cubics_table.get(i * 2)?;
-                    let y: f32 = cubics_table.get(i * 2 + 1)?;
+                    let x: f32 = cubics_table.get(i as i64 * 2)?;
+                    let y: f32 = cubics_table.get(i as i64 * 2 + 1)?;
                     cubics[i] = Point::new(x, y);
                 }
 
@@ -2639,8 +2669,8 @@ impl<'a> UserData for LuaCanvas<'a> {
                     Some(coords) => {
                         let mut result = [Point::new(0.0, 0.0); 4];
                         for i in 0..4 {
-                            let x: f32 = coords.get(i * 2)?;
-                            let y: f32 = coords.get(i * 2 + 1)?;
+                            let x: f32 = coords.get(i as i64 * 2)?;
+                            let y: f32 = coords.get(i as i64 * 2 + 1)?;
                             result[i] = Point::new(x, y);
                         }
                         Some(result)
@@ -2664,7 +2694,7 @@ impl<'a> UserData for LuaCanvas<'a> {
         methods.add_method(
             "drawTextBlob",
             |_, this, (blob, point, paint): (LuaTextBlob, LuaPoint, LikePaint)| {
-                this.draw_text_blob(blob.0, point, &paint);
+                this.draw_text_blob(blob.unwrap(), point, &paint);
                 Ok(())
             },
         );
@@ -2735,6 +2765,7 @@ impl UserData for LuaGfx {
                     "Unsupported encoded image format".to_string(),
                 ))
         });
+        // TODO: Add other ImageFilter constructors
         methods.add_method(
             "newBlurImageFilter",
             |_, _, (sigma_x, sigma_y): (f32, f32)| {
@@ -2755,6 +2786,8 @@ impl UserData for LuaGfx {
                     .map(LuaImageFilter)
             },
         );
+        // TODO: Add other ColorFilter constructors
+        // TODO: Add other MaskFilter constructors
         //TODO: methods.add_method("newLinearGradient", |ctx, this, ()| Ok(()));
         methods.add_method("newMatrix", |_, _, size| match size {
             None | Some(3) => Ok(LuaMatrix::Three(Matrix::new_identity())),
@@ -2799,16 +2832,17 @@ impl UserData for LuaGfx {
         methods.add_method(
             "newTypeface",
             |_, _, (family_name, font_style): (String, Option<LuaFontStyle>)| {
-                Ok(
-                    Typeface::new(family_name, font_style.map(|it| it.0).unwrap_or_default())
-                        .map(LuaTypeface),
+                Ok(Typeface::new(
+                    family_name,
+                    font_style.map(LuaFontStyle::unwrap).unwrap_or_default(),
                 )
+                .map(LuaTypeface))
             },
         );
         methods.add_method(
             "newFont",
             |_, _, (typeface, size): (LuaTypeface, Option<f32>)| {
-                Ok(LuaFont(Font::new(typeface.0, size)))
+                Ok(LuaFont(Font::new(typeface.unwrap(), size)))
             },
         );
         methods.add_method("newColorSpace", |_, _, name: String| match name.as_ref() {

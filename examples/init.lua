@@ -6,8 +6,12 @@ function draw_bg(canvas)
         b = 0.1,
         a = 1.0
     })
-    canvas:drawCircle(100, 100, 50, paint)
-    canvas:drawCircle({x = 200, y = 50.0}, 20, paint)
+    canvas:drawCircle({x = 200, y = 50.0}, 20, {
+        h = 1.0,
+        s = 0.8,
+        l = 0.5,
+        a = 1.0
+    })
     canvas:drawCircle({12.0, 200}, 20, paint)
 end
 

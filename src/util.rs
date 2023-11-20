@@ -47,7 +47,7 @@ pub fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (f32, f32, f32) 
         hue + ((-hue / 360.).ceil() * 360.)
     } else {
         hue - ((hue / 360.).floor() * 360.)
-    };
+    } / 360.;
     let saturation = saturation.min(1.).max(0.);
     let lightness = lightness.min(1.).max(0.);
 
