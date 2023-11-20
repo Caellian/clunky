@@ -1,7 +1,7 @@
 use std::{
     alloc::Layout,
     mem::{align_of, size_of},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use phf::phf_map;
@@ -9,86 +9,19 @@ use rlua::{prelude::*, Context as LuaContext, Table as LuaTable, UserData, Varia
 use skia_safe::{
     canvas::{self, SaveLayerFlags, SaveLayerRec},
     font_style::{Slant, Weight, Width},
+    image_filter::MapDirection,
     image_filters::{self, CropRect},
     matrix::{ScaleToFit, TypeMask},
     paint::{Cap as PaintCap, Join as PaintJoin},
     path::{AddPathMode, ArcSize, SegmentMask, Verb},
+    path_effect::DashInfo,
     *,
 };
 
-use crate::render::skia::ext::m44_as_slice_mut;
-
-#[inline]
-fn read_color_table(table: LuaTable) -> Color4f {
-    let r = table.get("r").unwrap_or_default();
-    let g = table.get("g").unwrap_or_default();
-    let b = table.get("b").unwrap_or_default();
-    let a = table.get("a").unwrap_or(1.0);
-    Color4f { r, g, b, a }
-}
-
-#[inline]
-fn write_color_table<'lua>(
-    color: Color,
-    ctx: LuaContext<'lua>,
-) -> Result<LuaTable<'lua>, LuaError> {
-    let result = ctx.create_table()?;
-    let rgb = color.to_rgb();
-    result.set("r", rgb.r / u8::MAX)?;
-    result.set("g", rgb.g / u8::MAX)?;
-    result.set("b", rgb.b / u8::MAX)?;
-    result.set("a", color.a() / u8::MAX)?;
-    Ok(result)
-}
-
-#[inline]
-fn write_color4f_table<'lua>(
-    color: Color4f,
-    ctx: LuaContext<'lua>,
-) -> Result<LuaTable<'lua>, LuaError> {
-    let result = ctx.create_table()?;
-    result.set("r", color.r)?;
-    result.set("g", color.g)?;
-    result.set("b", color.b)?;
-    result.set("a", color.a)?;
-    Ok(result)
-}
-
-#[inline]
-fn read_rect_table(table: LuaTable) -> Result<Rect, LuaError> {
-    let left = table.get("left").unwrap_or_default();
-    let top = table.get("top").unwrap_or_default();
-    let right = table
-        .get("right")
-        .map_err(|_| LuaError::FromLuaConversionError {
-            from: "table",
-            to: "Rect",
-            message: Some("Rect table missing 'right' field".to_string()),
-        })?;
-    let bottom = table
-        .get("bottom")
-        .map_err(|_| LuaError::FromLuaConversionError {
-            from: "table",
-            to: "Rect",
-            message: Some("Rect table missing 'bottom' field".to_string()),
-        })?;
-    Ok(Rect {
-        left,
-        top,
-        right,
-        bottom,
-    })
-}
-
-#[inline]
-fn write_rect_table<'lua>(rect: Rect, ctx: LuaContext<'lua>) -> Result<LuaTable<'lua>, LuaError> {
-    let result = ctx.create_table()?;
-    result.set("top", rect.top)?;
-    result.set("left", rect.left)?;
-    result.set("right", rect.right)?;
-    result.set("bottom", rect.bottom)?;
-    Ok(result)
-}
+use crate::{
+    render::skia::ext::{m44_as_slice, m44_as_slice_mut, matrix_as_slice, matrix_as_slice_mut},
+    util::hsl_to_rgb,
+};
 
 macro_rules! enum_naming {
     ($kind: ty: [$($value: expr => $name: literal,)+]) => {paste::paste!{
@@ -218,6 +151,11 @@ enum_naming! { PathFillType : [
     PathFillType::InverseEvenOdd => "inverse_evenodd",
 ]}
 
+enum_naming! { MapDirection : [
+    MapDirection::Forward => "forward",
+    MapDirection::Reverse => "reverse",
+]}
+
 macro_rules! named_bitflags {
     ($kind: ty: [$($value: expr => $name: literal,)+]) => {paste::paste!{
         enum_naming! { $kind : [
@@ -276,7 +214,289 @@ named_bitflags! { SegmentMask : [
     SegmentMask::CUBIC => "cubic",
 ]}
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct LuaColor {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl Default for LuaColor {
+    fn default() -> Self {
+        LuaColor {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        }
+    }
+}
+
+impl<'lua> FromLua<'lua> for LuaColor {
+    fn from_lua(value: LuaValue<'lua>, lua: LuaContext<'lua>) -> LuaResult<Self> {
+        let color = match value {
+            LuaValue::Table(it) => it,
+            other => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "Color",
+                    message: Some("expected a Color table".to_string()),
+                })
+            }
+        };
+
+        let is_rgb =
+            color.contains_key("r")? || color.contains_key("g")? || color.contains_key("b")?;
+
+        if is_rgb {
+            let r = color.get("r").unwrap_or_default();
+            let g = color.get("g").unwrap_or_default();
+            let b = color.get("b").unwrap_or_default();
+            let a = color.get("a").unwrap_or(1.0);
+
+            return Ok(LuaColor { r, g, b, a });
+        }
+
+        let is_hsl =
+            color.contains_key("h")? || color.contains_key("s")? || color.contains_key("l")?;
+
+        if is_hsl {
+            let h = color.get("h").unwrap_or_default();
+            let s = color.get("s").unwrap_or_default();
+            let l = color.get("l").unwrap_or_default();
+            let a = color.get("a").unwrap_or(1.0);
+
+            let (r, g, b) = hsl_to_rgb(h, s, l);
+            return Ok(LuaColor { r, g, b, a });
+        }
+
+        fn unknown_format() -> LuaError {
+            LuaError::FromLuaConversionError {
+                from: "table",
+                to: "Color",
+                message: Some("unknown Color format".to_string()),
+            }
+        }
+
+        let len = color.clone().pairs::<LuaValue, LuaValue>().count();
+        {
+            let indexed_floats = color
+                .clone()
+                .pairs::<usize, f32>()
+                .filter_map(|it| it.ok())
+                .count();
+            if indexed_floats != len {
+                return Err(unknown_format());
+            }
+        };
+
+        match len {
+            0 => Ok(LuaColor::default()),
+            3 | 4 => {
+                let r = color.get(0).map_err(|_| unknown_format())?;
+                let g = color.get(1).map_err(|_| unknown_format())?;
+                let b = color.get(2).map_err(|_| unknown_format())?;
+                let a = color.get(3).unwrap_or(1.);
+                Ok(LuaColor { r, g, b, a })
+            }
+            _ => Err(unknown_format()),
+        }
+    }
+}
+
+impl<'lua> ToLua<'lua> for LuaColor {
+    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+        let result = lua.create_table()?;
+        result.set("r", self.r)?;
+        result.set("g", self.g)?;
+        result.set("b", self.b)?;
+        result.set("a", self.a)?;
+        result.to_lua(lua)
+    }
+}
+
+impl From<Color4f> for LuaColor {
+    #[inline]
+    fn from(value: Color4f) -> Self {
+        LuaColor {
+            r: value.r,
+            g: value.g,
+            b: value.b,
+            a: value.a,
+        }
+    }
+}
+
+impl Into<Color4f> for LuaColor {
+    #[inline]
+    fn into(self) -> Color4f {
+        Color4f::new(self.r, self.g, self.b, self.a)
+    }
+}
+
+impl From<Color> for LuaColor {
+    #[inline]
+    fn from(value: Color) -> Self {
+        let rgb = value.to_rgb();
+        LuaColor {
+            r: rgb.r as f32 / u8::MAX as f32,
+            g: rgb.g as f32 / u8::MAX as f32,
+            b: rgb.b as f32 / u8::MAX as f32,
+            a: value.a() as f32 / u8::MAX as f32,
+        }
+    }
+}
+
+impl Into<Color> for LuaColor {
+    #[inline]
+    fn into(self) -> Color {
+        Into::<Color4f>::into(self).to_color()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct LuaRect {
+    pub from: LuaPoint,
+    pub to: LuaPoint,
+}
+
+impl<'lua> FromLua<'lua> for LuaRect {
+    fn from_lua(value: LuaValue<'lua>, lua: LuaContext<'lua>) -> LuaResult<Self> {
+        let rect = match value {
+            LuaValue::Table(it) => it,
+            other => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "Rect",
+                    message: Some("expected a Rect table".to_string()),
+                })
+            }
+        };
+
+        #[inline(always)]
+        fn required_field<'lua, T: FromLua<'lua>>(
+            rect: &LuaTable<'lua>,
+            field: &'static str,
+        ) -> LuaResult<T> {
+            rect.get(field)
+                .map_err(|_| LuaError::FromLuaConversionError {
+                    from: "table",
+                    to: "Rect",
+                    message: Some(format!("Rect table missing '{}' field", field)),
+                })
+        }
+
+        let skia_format = rect.contains_key("right")? || rect.contains_key("bottom")?;
+
+        if skia_format {
+            let left = rect.get("left").unwrap_or_default();
+            let top = rect.get("top").unwrap_or_default();
+            let right = required_field(&rect, "right")?;
+            let bottom = required_field(&rect, "bottom")?;
+
+            return Ok(LuaRect {
+                from: LuaPoint { value: [left, top] },
+                to: LuaPoint {
+                    value: [right, bottom],
+                },
+            });
+        }
+
+        let xywh_format = (rect.contains_key("width")? || rect.contains_key("w")?)
+            || (rect.contains_key("height")? || rect.contains_key("h")?);
+
+        if xywh_format {
+            let x = rect.get("x").unwrap_or_default();
+            let y = rect.get("y").unwrap_or_default();
+            let width: f32 = required_field(&rect, "w").or(required_field(&rect, "width"))?;
+            let height: f32 = required_field(&rect, "h").or(required_field(&rect, "height"))?;
+
+            return Ok(LuaRect {
+                from: LuaPoint { value: [x, y] },
+                to: LuaPoint {
+                    value: [x + width, y + height],
+                },
+            });
+        }
+
+        let from_to_format = rect.contains_key("from")? && rect.contains_key("to")?;
+
+        if from_to_format {
+            let from: LuaTable = required_field(&rect, "from")?;
+            let from = LuaPoint::try_from(from).map_err(|inner| LuaError::CallbackError {
+                traceback: "while converting 'from' Point table of Rect".to_string(),
+                cause: Arc::new(inner),
+            })?;
+            let to: LuaTable = required_field(&rect, "to")?;
+            let to = LuaPoint::try_from(to).map_err(|inner| LuaError::CallbackError {
+                traceback: "while converting 'to' Point table of Rect".to_string(),
+                cause: Arc::new(inner),
+            })?;
+
+            return Ok(LuaRect { from, to });
+        }
+
+        Err(LuaError::FromLuaConversionError {
+            from: "table",
+            to: "Rect",
+            message: Some("unknown Rect format; expected one of:\n- { left, top, right, bottom }\n- { x, y, width, height }\n- { from, to }".to_string()),
+        })
+    }
+}
+
+impl<'lua> ToLua<'lua> for LuaRect {
+    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+        let result = lua.create_table()?;
+        result.set("top", self.from.x())?;
+        result.set("left", self.from.y())?;
+        result.set("right", self.to.x())?;
+        result.set("bottom", self.to.y())?;
+        result.to_lua(lua)
+    }
+}
+
+impl From<Rect> for LuaRect {
+    fn from(value: Rect) -> Self {
+        LuaRect {
+            from: LuaPoint {
+                value: [value.left, value.top],
+            },
+            to: LuaPoint {
+                value: [value.right, value.bottom],
+            },
+        }
+    }
+}
+impl Into<Rect> for LuaRect {
+    fn into(self) -> Rect {
+        Rect::new(self.from.x(), self.from.y(), self.to.x(), self.to.y())
+    }
+}
+impl From<IRect> for LuaRect {
+    fn from(value: IRect) -> Self {
+        LuaRect {
+            from: LuaPoint {
+                value: [value.left as f32, value.top as f32],
+            },
+            to: LuaPoint {
+                value: [value.right as f32, value.bottom as f32],
+            },
+        }
+    }
+}
+impl Into<IRect> for LuaRect {
+    fn into(self) -> IRect {
+        IRect::new(
+            self.from.x() as i32,
+            self.from.y() as i32,
+            self.to.x() as i32,
+            self.to.y() as i32,
+        )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
 pub struct LuaPoint<const N: usize = 2> {
     value: [f32; N],
 }
@@ -284,11 +504,6 @@ pub struct LuaPoint<const N: usize = 2> {
 const COORD_NAME: &[&'static str] = &["x", "y", "z", "w"];
 
 impl<const N: usize> LuaPoint<N> {
-    #[inline(always)]
-    pub fn into_skia_point(self) -> Point {
-        Point::new(self.value[0], self.value[1])
-    }
-
     #[inline(always)]
     pub fn x(&self) -> f32 {
         self.value[0]
@@ -308,17 +523,35 @@ impl<const N: usize> LuaPoint<N> {
 }
 
 impl From<Point> for LuaPoint {
+    #[inline]
     fn from(value: Point) -> Self {
         LuaPoint {
             value: [value.x, value.y],
         }
     }
 }
-
+impl Into<Point> for LuaPoint {
+    fn into(self) -> Point {
+        Point {
+            x: self.x(),
+            y: self.y(),
+        }
+    }
+}
 impl From<Point3> for LuaPoint<3> {
+    #[inline]
     fn from(value: Point3) -> Self {
         LuaPoint {
             value: [value.x, value.y, value.z],
+        }
+    }
+}
+impl Into<Point3> for LuaPoint {
+    fn into(self) -> Point3 {
+        Point3 {
+            x: self.x(),
+            y: self.y(),
+            z: self.z(),
         }
     }
 }
@@ -340,19 +573,20 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
             });
         }
         let mut values = values.into_iter();
-        let a = values.next();
 
-        #[inline(always)]
-        fn bad_table_entries<const N: usize>(_: LuaError) -> LuaError {
-            LuaError::FromLuaConversionError {
-                from: "table",
-                to: "Point",
-                message: Some(format!(
-                    "Point table requires '{}' number entries",
-                    COORD_NAME[0..N].join("', '")
-                )),
+        let first = match values.next() {
+            Some(it) => it,
+            None => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "nil",
+                    to: "Point",
+                    message: Some(
+                        "Point value expects either an array with 2 values or 2 number values"
+                            .to_string(),
+                    ),
+                })
             }
-        }
+        };
 
         #[inline(always)]
         fn missing_argument<const N: usize>() -> LuaError {
@@ -386,36 +620,13 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
             }
         }
 
-        match a {
-            Some(LuaValue::Table(table))
-                if COORD_NAME[0..N]
-                    .iter()
-                    .all(|it| table.contains_key(*it).ok() == Some(true)) =>
-            {
-                let mut value = [0.0; N];
-                for (i, coord) in COORD_NAME[0..N].iter().enumerate() {
-                    value[i] = table.get(*coord).map_err(bad_table_entries::<N>)?;
-                }
+        match first {
+            LuaValue::Table(table) => {
+                let result = Self::try_from(table)?;
                 *consumed += 1;
-                Ok(LuaPoint { value })
+                Ok(result)
             }
-            Some(LuaValue::Table(table)) => {
-                if table.len()? != N as i64 {
-                    return Err(LuaError::FromLuaConversionError {
-                        from: "table",
-                        to: "Point",
-                        message: Some(format!("Point value array expects {} values", N)),
-                    });
-                }
-
-                let mut value = [0.0; N];
-                for (i, value) in value.iter_mut().enumerate() {
-                    *value = table.get(i).map_err(bad_table_entries::<N>)?;
-                }
-                *consumed += 1;
-                Ok(LuaPoint { value })
-            }
-            Some(LuaValue::Number(x)) => {
+            LuaValue::Number(x) => {
                 let mut value = [x as f32; N];
                 for i in 1..N {
                     value[i] = read_coord::<N>(values.next())?;
@@ -423,7 +634,7 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
                 *consumed += N;
                 Ok(LuaPoint { value })
             }
-            Some(LuaValue::Integer(x)) => {
+            LuaValue::Integer(x) => {
                 let mut value = [x as f32; N];
                 for i in 1..N {
                     value[i] = read_coord::<N>(values.next())?;
@@ -431,7 +642,7 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
                 *consumed += N;
                 Ok(LuaPoint { value })
             }
-            Some(other) => {
+            other => {
                 log::debug!("{:?}", other);
                 Err(LuaError::FromLuaConversionError {
                     from: other.type_name(),
@@ -442,14 +653,54 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
                     ),
                 })
             }
-            None => Err(LuaError::FromLuaConversionError {
-                from: "()",
+        }
+    }
+}
+
+impl<'lua, const N: usize> TryFrom<LuaTable<'lua>> for LuaPoint<N> {
+    type Error = LuaError;
+
+    fn try_from(table: LuaTable<'lua>) -> Result<Self, Self::Error> {
+        #[inline(always)]
+        fn bad_table_entries<const N: usize>(_: LuaError) -> LuaError {
+            LuaError::FromLuaConversionError {
+                from: "table",
                 to: "Point",
-                message: Some(
-                    "Point value expects either an array with 2 values or 2 number values"
-                        .to_string(),
-                ),
-            }),
+                message: Some(format!(
+                    "Point table requires {{'{}'}} number entries, optionally named",
+                    COORD_NAME[0..N].join("', '")
+                )),
+            }
+        }
+
+        if COORD_NAME[0..N]
+            .iter()
+            .all(|it| table.contains_key(*it).ok() == Some(true))
+        {
+            let mut value = [0.0; N];
+            for (i, coord) in COORD_NAME[0..N].iter().enumerate() {
+                value[i] = table.get(*coord).map_err(bad_table_entries::<N>)?;
+            }
+            Ok(LuaPoint { value })
+        } else {
+            let len = table
+                .clone()
+                .pairs::<usize, f32>()
+                .filter(|it| it.is_ok())
+                .count();
+            if len != N {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "table",
+                    to: "Point",
+                    message: Some(format!("Point value array expects {} values", N)),
+                });
+            }
+
+            let mut value = [0.0; N];
+            for (i, value) in value.iter_mut().enumerate() {
+                *value = table.get(i).map_err(bad_table_entries::<N>)?;
+            }
+            Ok(LuaPoint { value })
         }
     }
 }
@@ -467,7 +718,7 @@ impl<'lua, const N: usize> ToLua<'lua> for LuaPoint<N> {
 }
 
 #[derive(Clone)]
-pub struct LuaLine<const N: usize> {
+pub struct LuaLine<const N: usize = 2> {
     pub from: LuaPoint<N>,
     pub to: LuaPoint<N>,
 }
@@ -480,6 +731,15 @@ impl<'lua, const N: usize> ToLua<'lua> for LuaLine<N> {
         result.set("to", self.to.to_lua(lua)?)?;
 
         result.to_lua(lua)
+    }
+}
+
+impl From<(Point, Point)> for LuaLine {
+    fn from((from, to): (Point, Point)) -> Self {
+        LuaLine {
+            from: LuaPoint::from(from),
+            to: LuaPoint::from(to),
+        }
     }
 }
 
@@ -540,23 +800,77 @@ impl UserData for LuaImage {
 wrap_skia_handle!(ColorSpace);
 
 impl UserData for LuaColorSpace {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(_methods: &mut T) {}
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method("isSRGB", |_, this, ()| Ok(this.is_srgb()));
+        methods.add_method("toXYZD50Hash", |_, this, ()| Ok(this.to_xyzd50_hash().0));
+        methods.add_method("makeLinearGamma", |_, this, ()| {
+            Ok(LuaColorSpace(this.with_linear_gamma()))
+        });
+        methods.add_method("makeSRGBGamma", |_, this, ()| {
+            Ok(LuaColorSpace(this.with_srgb_gamma()))
+        });
+        methods.add_method("makeColorSpin", |_, this, ()| {
+            Ok(LuaColorSpace(this.with_color_spin()))
+        });
+    }
 }
 
 wrap_skia_handle!(ImageFilter);
 
 impl UserData for LuaImageFilter {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(_methods: &mut T) {}
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method(
+            "filterBounds",
+            |_,
+             this,
+             (src, ctm, map_direction, input_rect): (
+                LuaRect,
+                LuaMatrix,
+                String,
+                Option<LuaRect>,
+            )| {
+                let src: IRect = src.into();
+                let ctm: Matrix = ctm.into();
+                let map_direction = read_map_direction(map_direction)?;
+                let input_rect = input_rect.map(Into::<IRect>::into);
+                let filtered = this.filter_bounds(src, &ctm, map_direction, input_rect.as_ref());
+                Ok(LuaRect::from(filtered))
+            },
+        );
+        methods.add_method("isColorFilterNode", |_, this, ()| {
+            Ok(this.color_filter_node().map(LuaColorFilter))
+        });
+        methods.add_method("asAColorFilter", |_, this, ()| {
+            Ok(this.to_a_color_filter().map(LuaColorFilter))
+        });
+        methods.add_method("countInputs", |_, this, ()| Ok(this.count_inputs()));
+        methods.add_method("getInput", |_, this, index: usize| {
+            Ok(this.get_input(index).map(LuaImageFilter))
+        });
+        methods.add_method("computeFastBounds", |_, this, rect: LuaRect| {
+            let rect: Rect = rect.into();
+            let bounds = this.compute_fast_bounds(rect);
+            Ok(LuaRect::from(bounds))
+        });
+        methods.add_method("canComputeFastBounds", |_, this, ()| {
+            Ok(this.can_compute_fast_bounds())
+        });
+        methods.add_method("makeWithLocalMatrix", |_, this, matrix: LuaMatrix| {
+            let matrix: Matrix = matrix.into();
+            Ok(this.with_local_matrix(&matrix).map(LuaImageFilter))
+        })
+    }
 }
 
 wrap_skia_handle!(ColorFilter);
 
 impl UserData for LuaColorFilter {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        // TODO: https://api.skia.org/classSkColorFilter.html
         methods.add_method("toAColorMode", |ctx, this, ()| {
             if let Some((color, mode)) = this.to_a_color_mode() {
                 let result = ctx.create_table()?;
-                result.set(0, write_color_table(color, ctx)?)?;
+                result.set(0, LuaColor::from(color))?;
                 result.set(1, blend_mode_name(mode))?;
                 Ok(LuaValue::Table(result))
             } else {
@@ -594,12 +908,75 @@ impl UserData for LuaColorFilter {
 wrap_skia_handle!(MaskFilter);
 
 impl UserData for LuaMaskFilter {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(_methods: &mut T) {}
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method("approximateFilteredBounds", |_, this, src: LuaRect| {
+            let src: Rect = src.into();
+            Ok(LuaRect::from(this.approximate_filtered_bounds(src)))
+        });
+    }
+}
+
+wrap_skia_handle!(DashInfo);
+
+impl UserData for LuaDashInfo {
+    // TODO: impl LuaDashInfo
+}
+
+wrap_skia_handle!(StrokeRec);
+
+impl UserData for LuaStrokeRec {
+    // TODO: impl LuaStrokeRec
 }
 
 wrap_skia_handle!(PathEffect);
 
-impl UserData for LuaPathEffect {}
+impl UserData for LuaPathEffect {
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method("asADash", |_, this, ()| {
+            Ok(this.as_a_dash().map(LuaDashInfo))
+        });
+        methods.add_method(
+            "filterPath",
+            |ctx,
+             this,
+             (src, stroke_rec, cull_rect, ctm): (
+                LuaPath,
+                LuaStrokeRec,
+                LuaRect,
+                Option<LuaMatrix>,
+            )| {
+                let cull_rect: Rect = cull_rect.into();
+                let mut dst = src.0.clone();
+                let mut stroke_rec = stroke_rec.0;
+                match ctm {
+                    None => match this.filter_path(&src, &stroke_rec, cull_rect) {
+                        Some((new_dst, new_stroke_rec)) => {
+                            dst = new_dst;
+                            stroke_rec = new_stroke_rec;
+                        }
+                        None => return Ok(LuaNil),
+                    },
+                    Some(ctm) => {
+                        if !this.filter_path_inplace_with_matrix(
+                            &mut dst,
+                            &src,
+                            &mut stroke_rec,
+                            cull_rect,
+                            &ctm.into(),
+                        ) {
+                            return Ok(LuaNil);
+                        }
+                    }
+                };
+                let result = ctx.create_table()?;
+                result.set(0, LuaPath(dst))?;
+                result.set(1, LuaStrokeRec(stroke_rec))?;
+                result.to_lua(ctx)
+            },
+        );
+        methods.add_method("needsCTM", |_, this, ()| Ok(this.needs_ctm()));
+    }
+}
 
 #[derive(Clone)]
 pub enum LuaMatrix {
@@ -607,11 +984,85 @@ pub enum LuaMatrix {
     Four(M44),
 }
 
+impl Into<Matrix> for LuaMatrix {
+    fn into(self) -> Matrix {
+        match self {
+            LuaMatrix::Three(it) => it,
+            LuaMatrix::Four(other) => other.to_m33(),
+        }
+    }
+}
+impl Into<M44> for LuaMatrix {
+    fn into(self) -> M44 {
+        match self {
+            LuaMatrix::Four(it) => it,
+            #[rustfmt::skip]
+            LuaMatrix::Three(other) => {
+                let m = matrix_as_slice(&other);
+                M44::row_major(&[
+                    m[0], m[1], 0., m[2],
+                    m[3], m[4], 0., m[5],
+                      0.,   0., 1.,   0.,
+                    m[6], m[7], 0., m[8],
+                ])
+            }
+        }
+    }
+}
+
 impl UserData for LuaMatrix {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
         methods.add_method("getDimensions", |_, this, ()| match this {
             LuaMatrix::Three(_) => Ok(3),
             LuaMatrix::Four(_) => Ok(4),
+        });
+        methods.add_method("get", |ctx, this, pos: LuaPoint| {
+            let [col, row] = pos.value.map(|it| it as usize);
+            match this {
+                LuaMatrix::Three(it) => {
+                    let i = col + row * 3;
+                    if i < 9 && col < 3 {
+                        let it = matrix_as_slice(it);
+                        it[i].to_lua(ctx)
+                    } else {
+                        Ok(LuaNil)
+                    }
+                }
+                LuaMatrix::Four(it) => {
+                    let i = col + row * 4;
+                    if i < 16 && col < 4 {
+                        let it = m44_as_slice(it);
+                        it[i].to_lua(ctx)
+                    } else {
+                        Ok(LuaNil)
+                    }
+                }
+            }
+        });
+        methods.add_method_mut("set", |ctx, this, (pos, value): (LuaPoint, f32)| {
+            let [col, row] = pos.value.map(|it| it as usize);
+            match this {
+                LuaMatrix::Three(it) => {
+                    let i = col + row * 3;
+                    if i < 9 && col < 3 {
+                        let it = matrix_as_slice_mut(it);
+                        it[i] = value;
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                LuaMatrix::Four(it) => {
+                    let i = col + row * 4;
+                    if i < 16 && col < 4 {
+                        let it = m44_as_slice_mut(it);
+                        it[i] = value;
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                }
+            }
         });
         methods.add_method("getType", |ctx, this, ()| match this {
             LuaMatrix::Three(it) => write_type_mask_table(ctx, it.get_type()).map(LuaValue::Table),
@@ -657,18 +1108,12 @@ impl UserData for LuaMatrix {
                 LuaMatrix::Four(it) => LuaValue::Number(it.row(2)[2] as f64),
             })
         });
-        methods.add_method_mut("setScaleZ", |_, this, value: f32| {
-            match this {
-                LuaMatrix::Three(_) => {
-                    return Err(LuaError::RuntimeError(
-                        "3x3 matrix doesn't have a Z scale component".to_string(),
-                    ))
-                }
-                LuaMatrix::Four(it) => {
-                    m44_as_slice_mut(it)[10] = value;
-                }
+        methods.add_method_mut("setScaleZ", |_, this, value: f32| match this {
+            LuaMatrix::Three(_) => Ok(false),
+            LuaMatrix::Four(it) => {
+                m44_as_slice_mut(it)[10] = value;
+                Ok(true)
             }
-            Ok(())
         });
         methods.add_method("getTranslateX", |_, this, ()| {
             Ok(match this {
@@ -710,18 +1155,12 @@ impl UserData for LuaMatrix {
                 LuaMatrix::Four(it) => LuaValue::Number(it.row(2)[3] as f64),
             })
         });
-        methods.add_method_mut("setTranslateZ", |_, this, value: f32| {
-            match this {
-                LuaMatrix::Three(_) => {
-                    return Err(LuaError::RuntimeError(
-                        "3x3 matrix doesn't have a Z translation component".to_string(),
-                    ))
-                }
-                LuaMatrix::Four(it) => {
-                    m44_as_slice_mut(it)[11] = value;
-                }
+        methods.add_method_mut("setTranslateZ", |_, this, value: f32| match this {
+            LuaMatrix::Three(_) => Ok(false),
+            LuaMatrix::Four(it) => {
+                m44_as_slice_mut(it)[11] = value;
+                Ok(true)
             }
-            Ok(())
         });
         methods.add_method("getSkewX", |_, this, ()| {
             Ok(match this {
@@ -759,9 +1198,9 @@ impl UserData for LuaMatrix {
         });
         methods.add_method_mut(
             "setRectToRect",
-            |_, this, (from, to, stf): (LuaTable, LuaTable, String)| {
-                let from = read_rect_table(from)?;
-                let to = read_rect_table(to)?;
+            |_, this, (from, to, stf): (LuaRect, LuaRect, String)| {
+                let from: Rect = from.into();
+                let to: Rect = to.into();
                 let stf = read_scale_to_fit(stf)?;
                 Ok(match this {
                     LuaMatrix::Three(it) => it.set_rect_to_rect(from, to, stf),
@@ -780,15 +1219,11 @@ impl UserData for LuaMatrix {
                 })
             },
         );
-        methods.add_method("invert", |ctx, this, ()| {
-            let inverse = match this {
+        methods.add_method("invert", |_, this, ()| {
+            Ok(match this {
                 LuaMatrix::Three(mx) => mx.invert().map(LuaMatrix::Three),
                 LuaMatrix::Four(mx) => mx.invert().map(LuaMatrix::Four),
-            };
-            match inverse {
-                Some(it) => it.to_lua(ctx),
-                None => Ok(LuaNil),
-            }
+            })
         });
         methods.add_method("transpose", |_, this, ()| {
             Ok(match this {
@@ -837,9 +1272,9 @@ impl UserData for LuaMatrix {
             }
             Ok(result)
         });
-        methods.add_method("mapRect", |ctx, this, rect: LuaTable| {
-            let rect = read_rect_table(rect)?;
-            let rect = match this {
+        methods.add_method("mapRect", |_, this, rect: LuaRect| {
+            let rect: Rect = rect.into();
+            let mapped = match this {
                 LuaMatrix::Three(it) => it.map_rect(rect).0,
                 LuaMatrix::Four(it) => {
                     let a = it.map(rect.left, rect.top, 0.0, 1.0);
@@ -847,7 +1282,7 @@ impl UserData for LuaMatrix {
                     Rect::new(a.x, a.y, b.x, b.y)
                 }
             };
-            write_rect_table(rect, ctx)
+            Ok(LuaRect::from(mapped))
         });
     }
 }
@@ -866,11 +1301,8 @@ impl UserData for LuaPaint {
             this.set_dither(dither);
             Ok(())
         });
-        methods.add_method_mut("getImageFilter", |ctx, this, ()| {
-            match this.image_filter() {
-                Some(it) => Ok(LuaImageFilter(it).to_lua(ctx)?),
-                None => Ok(LuaNil),
-            }
+        methods.add_method_mut("getImageFilter", |_, this, ()| {
+            Ok(this.image_filter().map(LuaImageFilter))
         });
         methods.add_method_mut(
             "setImageFilter",
@@ -879,9 +1311,8 @@ impl UserData for LuaPaint {
                 Ok(())
             },
         );
-        methods.add_method_mut("getMaskFilter", |ctx, this, ()| match this.mask_filter() {
-            Some(it) => Ok(LuaMaskFilter(it).to_lua(ctx)?),
-            None => Ok(LuaNil),
+        methods.add_method_mut("getMaskFilter", |_, this, ()| {
+            Ok(this.mask_filter().map(LuaMaskFilter))
         });
         methods.add_method_mut(
             "setMaskFilter",
@@ -890,11 +1321,8 @@ impl UserData for LuaPaint {
                 Ok(())
             },
         );
-        methods.add_method_mut("getColorFilter", |ctx, this, ()| {
-            match this.color_filter() {
-                Some(it) => Ok(LuaColorFilter(it).to_lua(ctx)?),
-                None => Ok(LuaNil),
-            }
+        methods.add_method_mut("getColorFilter", |_, this, ()| {
+            Ok(this.color_filter().map(LuaColorFilter))
         });
         methods.add_method_mut(
             "setColorFilter",
@@ -908,13 +1336,11 @@ impl UserData for LuaPaint {
             this.set_alpha_f(alpha);
             Ok(())
         });
-        methods.add_method("getColor", |ctx, this, ()| {
-            write_color4f_table(this.color4f(), ctx)
-        });
+        methods.add_method("getColor", |_, this, ()| Ok(LuaColor::from(this.color4f())));
         methods.add_method_mut(
             "setColor",
-            |_, this, (color, color_space): (LuaTable, Option<LuaColorSpace>)| {
-                let color = read_color_table(color);
+            |_, this, (color, color_space): (LuaColor, Option<LuaColorSpace>)| {
+                let color: Color4f = color.into();
                 this.set_color4f(color, color_space.map(|it| it.0).as_ref());
                 Ok(())
             },
@@ -1027,9 +1453,9 @@ impl UserData for LuaPath {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
         methods.add_method_mut(
             "addArc",
-            |_, this, (oval, start_angle, sweep_angle): (LuaTable, f32, f32)| {
-                let oval = read_rect_table(oval)?;
-                this.add_arc(oval, start_angle, sweep_angle);
+            |_, this, (oval, start_angle, sweep_angle): (LuaRect, f32, f32)| {
+                let oval: Rect = oval.into();
+                this.add_arc(&oval, start_angle, sweep_angle);
                 Ok(())
             },
         );
@@ -1040,14 +1466,14 @@ impl UserData for LuaPath {
                     Some(it) => Some(read_path_direction(it)?),
                     None => None,
                 };
-                this.add_circle(point.into_skia_point(), radius, dir);
+                this.add_circle(point, radius, dir);
                 Ok(())
             },
         );
         methods.add_method_mut(
             "addOval",
-            |_, this, (oval, dir, start): (LuaTable, Option<String>, Option<usize>)| {
-                let oval = read_rect_table(oval)?;
+            |_, this, (oval, dir, start): (LuaRect, Option<String>, Option<usize>)| {
+                let oval: Rect = oval.into();
                 let dir = match dir {
                     Some(it) => read_path_direction(it)?,
                     None => PathDirection::CW,
@@ -1064,22 +1490,22 @@ impl UserData for LuaPath {
                     Some(it) => Some(read_add_path_mode(it)?),
                     None => None,
                 };
-                this.add_path(&other, point.into_skia_point(), mode);
+                this.add_path(&other, point, mode);
                 Ok(())
             },
         );
         methods.add_method_mut(
             "addPoly",
             |_, this, (points, close): (Variadic<LuaPoint>, bool)| {
-                let points: Vec<_> = points.into_iter().map(LuaPoint::into_skia_point).collect();
+                let points: Vec<_> = points.into_iter().map(LuaPoint::into).collect();
                 this.add_poly(&points, close);
                 Ok(())
             },
         );
         methods.add_method_mut(
             "addRect",
-            |_, this, (rect, dir, start): (LuaTable, Option<String>, Option<usize>)| {
-                let rect = read_rect_table(rect)?;
+            |_, this, (rect, dir, start): (LuaRect, Option<String>, Option<usize>)| {
+                let rect: Rect = rect.into();
                 let dir = match dir {
                     Some(it) => read_path_direction(it)?,
                     None => PathDirection::CW,
@@ -1091,8 +1517,8 @@ impl UserData for LuaPath {
         );
         methods.add_method_mut(
             "addRoundRect",
-            |_, this, (rect, rounding, dir): (LuaTable, LuaPoint, Option<String>)| {
-                let rect = read_rect_table(rect)?;
+            |_, this, (rect, rounding, dir): (LuaRect, LuaPoint, Option<String>)| {
+                let rect: Rect = rect.into();
                 let dir = match dir {
                     Some(it) => read_path_direction(it)?,
                     None => PathDirection::CW,
@@ -1113,8 +1539,8 @@ impl UserData for LuaPath {
                 Ok(())
             },
         );
-        methods.add_method_mut("arcTo", |_, this, (oval, start_angle, sweep_angle, force_move_to): (LuaTable, f32, f32, bool)| {
-            let oval = read_rect_table(oval)?;
+        methods.add_method_mut("arcTo", |_, this, (oval, start_angle, sweep_angle, force_move_to): (LuaRect, f32, f32, bool)| {
+            let oval: Rect = oval.into();
             this.arc_to(oval, start_angle, sweep_angle, force_move_to);
             Ok(())
         });
@@ -1122,54 +1548,40 @@ impl UserData for LuaPath {
             this.close();
             Ok(())
         });
-        methods.add_method("computeTightBounds", |ctx, this, ()| {
-            let bounds = write_rect_table(this.compute_tight_bounds(), ctx)?;
-            Ok(bounds)
+        methods.add_method("computeTightBounds", |_, this, ()| {
+            Ok(LuaRect::from(this.compute_tight_bounds()))
         });
         methods.add_method_mut(
             "conicTo",
             |_, this, (p1, p2, w): (LuaPoint, LuaPoint, f32)| {
-                this.conic_to(p1.into_skia_point(), p2.into_skia_point(), w);
+                this.conic_to(p1, p2, w);
                 Ok(())
             },
         );
-        methods.add_method("conservativelyContainsRect", |_, this, rect: LuaTable| {
-            let rect = read_rect_table(rect)?;
+        methods.add_method("conservativelyContainsRect", |_, this, rect: LuaRect| {
+            let rect: Rect = rect.into();
             Ok(this.conservatively_contains_rect(rect))
         });
-        methods.add_method("contains", |_, this, p: LuaPoint| {
-            Ok(this.contains(p.into_skia_point()))
-        });
+        methods.add_method("contains", |_, this, p: LuaPoint| Ok(this.contains(p)));
         methods.add_method("countPoints", |_, this, ()| Ok(this.count_points()));
         methods.add_method("countVerbs", |_, this, ()| Ok(this.count_verbs()));
         methods.add_method_mut(
             "cubicTo",
             |_, this, (p1, p2, p3): (LuaPoint, LuaPoint, LuaPoint)| {
-                this.cubic_to(
-                    p1.into_skia_point(),
-                    p2.into_skia_point(),
-                    p3.into_skia_point(),
-                );
+                this.cubic_to(p1, p2, p3);
                 Ok(())
             },
         );
-        methods.add_method("getBounds", |ctx, this, ()| {
-            let bounds = write_rect_table(*this.bounds(), ctx)?;
-            Ok(bounds)
-        });
+        methods.add_method("getBounds", |_, this, ()| Ok(LuaRect::from(*this.bounds())));
         methods.add_method("getFillType", |_, this, ()| {
             Ok(path_fill_type_name(this.fill_type()))
         });
         methods.add_method("getGenerationID", |_, this, ()| Ok(this.generation_id()));
-        methods.add_method("getLastPt", |ctx, this, ()| match this.last_pt() {
-            Some(it) => Ok(LuaPoint::from(it).to_lua(ctx)?),
-            None => Ok(LuaNil),
+        methods.add_method("getLastPt", |_, this, ()| {
+            Ok(this.last_pt().map(LuaPoint::from))
         });
-        methods.add_method("getPoint", |ctx, this, index: usize| {
-            match this.get_point(index) {
-                Some(it) => LuaPoint::from(it).to_lua(ctx),
-                None => Ok(LuaNil),
-            }
+        methods.add_method("getPoint", |_, this, index: usize| {
+            Ok(this.get_point(index).map(LuaPoint::from))
         });
         methods.add_method("getPoints", |ctx, this, count: Option<usize>| unsafe {
             let count = count.unwrap_or_else(|| this.count_points());
@@ -1237,38 +1649,20 @@ impl UserData for LuaPath {
         methods.add_method("isLastContourClosed", |_, this, ()| {
             Ok(this.is_last_contour_closed())
         });
-        methods.add_method("isLine", |ctx, this, ()| {
-            Ok(match this.is_line() {
-                Some((from, to)) => LuaLine {
-                    from: LuaPoint::from(from),
-                    to: LuaPoint::from(to),
-                }
-                .to_lua(ctx),
-                None => Ok(LuaNil),
-            })
+        methods.add_method("isLine", |_, this, ()| {
+            Ok(this.is_line().map(LuaLine::from))
         });
-        methods.add_method("isOval", |ctx, this, ()| {
-            Ok(match this.is_oval() {
-                Some(oval) => write_rect_table(oval, ctx)?.to_lua(ctx)?,
-                None => LuaNil,
-            })
+        methods.add_method("isOval", |_, this, ()| {
+            Ok(this.is_oval().map(LuaRect::from))
         });
-        methods.add_method("isRect", |ctx, this, ()| {
-            Ok(match this.is_rect() {
-                Some((rect, _, _)) => write_rect_table(rect, ctx)?.to_lua(ctx)?,
-                None => LuaNil,
-            })
+        methods.add_method("isRect", |_, this, ()| {
+            Ok(this.is_rect().map(|(rect, _, _)| LuaRect::from(rect)))
         });
-        methods.add_method("isRRect", |ctx, this, ()| {
-            Ok(match this.is_rrect() {
-                Some(rrect) => LuaRRect(rrect).to_lua(ctx),
-                None => Ok(LuaNil),
-            })
-        });
+        methods.add_method("isRRect", |_, this, ()| Ok(this.is_rrect().map(LuaRRect)));
         methods.add_method("isValid", |_, this, ()| Ok(this.is_valid()));
         methods.add_method("isVolatile", |_, this, ()| Ok(this.is_volatile()));
         methods.add_method_mut("lineTo", |_, this, point: LuaPoint| {
-            this.line_to(point.into_skia_point());
+            this.line_to(point);
             Ok(())
         });
         methods.add_method_mut("makeScale", |_, this, (sx, sy): (f32, Option<f32>)| {
@@ -1278,14 +1672,7 @@ impl UserData for LuaPath {
         methods.add_method_mut(
             "makeTransform",
             |_, this, (matrix, pc): (LuaMatrix, Option<bool>)| {
-                let matrix = match matrix {
-                    LuaMatrix::Three(it) => it,
-                    LuaMatrix::Four(_) => {
-                        return Err(LuaError::RuntimeError(
-                            "can't apply 4x4 transform matrix to path".to_string(),
-                        ));
-                    }
-                };
+                let matrix = matrix.into();
                 let pc = match pc.unwrap_or(true) {
                     true => skia_safe::matrix::ApplyPerspectiveClip::Yes,
                     false => skia_safe::matrix::ApplyPerspectiveClip::No,
@@ -1294,38 +1681,34 @@ impl UserData for LuaPath {
             },
         );
         methods.add_method_mut("moveTo", |_, this, p: LuaPoint| {
-            this.move_to(p.into_skia_point());
+            this.move_to(p);
             Ok(())
         });
         methods.add_method_mut("offset", |_, this, d: LuaPoint| {
-            this.offset(d.into_skia_point());
+            this.offset(d);
             Ok(())
         });
         methods.add_method_mut("quadTo", |_, this, (p1, p2): (LuaPoint, LuaPoint)| {
-            this.quad_to(p1.into_skia_point(), p2.into_skia_point());
+            this.quad_to(p1, p2);
             Ok(())
         });
         methods.add_method_mut("rArcTo", |_, this, (r, x_axis_rotate, arc_size, sweep, d): (LuaPoint, f32, String, String, LuaPoint)| {
             let arc_size = read_arc_size(arc_size)?;
             let sweep = read_path_direction(sweep)?;
-            this.r_arc_to_rotated(r.into_skia_point(), x_axis_rotate, arc_size, sweep, d.into_skia_point());
+            this.r_arc_to_rotated(r, x_axis_rotate, arc_size, sweep, d);
             Ok(())
         });
         methods.add_method_mut(
             "rConicTo",
             |_, this, (d1, d2, w): (LuaPoint, LuaPoint, f32)| {
-                this.r_conic_to(d1.into_skia_point(), d2.into_skia_point(), w);
+                this.r_conic_to(d1, d2, w);
                 Ok(())
             },
         );
         methods.add_method_mut(
             "rCubicTo",
             |_, this, (d1, d2, d3): (LuaPoint, LuaPoint, LuaPoint)| {
-                this.r_cubic_to(
-                    d1.into_skia_point(),
-                    d2.into_skia_point(),
-                    d3.into_skia_point(),
-                );
+                this.r_cubic_to(d1, d2, d3);
                 Ok(())
             },
         );
@@ -1342,15 +1725,15 @@ impl UserData for LuaPath {
             Ok(())
         });
         methods.add_method_mut("rLineTo", |_, this, point: LuaPoint| {
-            this.r_line_to(point.into_skia_point());
+            this.r_line_to(point);
             Ok(())
         });
         methods.add_method_mut("rMoveTo", |_, this, point: LuaPoint| {
-            this.r_move_to(point.into_skia_point());
+            this.r_move_to(point);
             Ok(())
         });
         methods.add_method_mut("rQuadTo", |_, this, (dx1, dx2): (LuaPoint, LuaPoint)| {
-            this.r_quad_to(dx1.into_skia_point(), dx2.into_skia_point());
+            this.r_quad_to(dx1, dx2);
             Ok(())
         });
         methods.add_method_mut("setFillType", |_, this, fill_type: String| {
@@ -1362,21 +1745,17 @@ impl UserData for LuaPath {
             Ok(())
         });
         methods.add_method_mut("setLastPt", |_, this, point: LuaPoint| {
-            this.set_last_pt(point.into_skia_point());
+            this.set_last_pt(point);
             Ok(())
         });
         methods.add_method_mut("toggleInverseFillType", |_, this, ()| {
             this.toggle_inverse_fill_type();
             Ok(())
         });
-        methods.add_method_mut("transform", |_, this, matrix: LuaMatrix| match matrix {
-            LuaMatrix::Three(matrix) => {
-                this.transform(&matrix);
-                Ok(())
-            }
-            LuaMatrix::Four(_) => Err(LuaError::RuntimeError(
-                "can't 3D transform path with a 4x4 matrix".to_string(),
-            )),
+        methods.add_method_mut("transform", |_, this, matrix: LuaMatrix| {
+            let matrix = matrix.into();
+            this.transform(&matrix);
+            Ok(())
         });
     }
 }
@@ -1384,13 +1763,13 @@ impl UserData for LuaPath {
 wrap_skia_handle!(RRect);
 
 impl UserData for LuaRRect {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(_methods: &mut T) {}
+    // TODO: https://api.skia.org/classSkRRect.html
 }
 
 wrap_skia_handle!(Typeface);
 
 impl UserData for LuaTypeface {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(_methods: &mut T) {}
+    // TODO: https://api.skia.org/classSkTypeface.html
 }
 
 #[derive(Clone, Copy)]
@@ -1532,30 +1911,37 @@ impl<'lua> FromLua<'lua> for FromLuaFontWidth {
 wrap_skia_handle!(FontStyle);
 
 impl UserData for LuaFontStyle {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(_methods: &mut T) {}
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method("weight", |_, this, ()| Ok(*this.weight()));
+        methods.add_method("width", |_, this, ()| Ok(*this.width()));
+        methods.add_method("slant", |_, this, ()| Ok(slant_name(this.slant())));
+    }
 }
 
 wrap_skia_handle!(Font);
 
 impl UserData for LuaFont {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(_methods: &mut T) {}
+    // TODO: https://api.skia.org/classSkFont.html
 }
 
 wrap_skia_handle!(TextBlob);
 
 impl UserData for LuaTextBlob {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(_methods: &mut T) {}
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method("bounds", |_, this, ()| Ok(LuaRect::from(*this.bounds())));
+        // TODO: getIntercepts
+    }
 }
 
 #[derive(Clone)]
-pub struct FromLuaSaveLayerRec {
+pub struct LuaSaveLayerRec {
     bounds: Option<Rect>,
     paint: Option<LuaPaint>,
     backdrop: Option<LuaImageFilter>,
     flags: SaveLayerFlags,
 }
 
-impl FromLuaSaveLayerRec {
+impl LuaSaveLayerRec {
     pub fn to_skia_save_layer_rec(&self) -> SaveLayerRec {
         let mut result = SaveLayerRec::default();
         if let Some(bounds) = &self.bounds {
@@ -1574,9 +1960,9 @@ impl FromLuaSaveLayerRec {
     }
 }
 
-impl<'lua> FromLua<'lua> for FromLuaSaveLayerRec {
+impl<'lua> FromLua<'lua> for LuaSaveLayerRec {
     fn from_lua(lua_value: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
-        let mut result = FromLuaSaveLayerRec {
+        let mut result = LuaSaveLayerRec {
             bounds: None,
             paint: None,
             backdrop: None,
@@ -1595,21 +1981,15 @@ impl<'lua> FromLua<'lua> for FromLuaSaveLayerRec {
         };
 
         if table.contains_key("bounds")? {
-            let bounds_table: LuaValue = table.get("bounds")?;
-            match bounds_table {
-                LuaValue::Table(bounds_table) => {
-                    result.bounds = Some(read_rect_table(bounds_table)?)
-                }
-                _ => {
-                    return Err(LuaError::FromLuaConversionError {
-                        from: "table",
-                        to: "Rect",
-                        message: Some(format!(
-                            "expected SaveLayerRec.bounds entry to be a Rect table"
-                        )),
-                    })
-                }
-            };
+            result.bounds = Some(
+                table
+                    .get::<&'static str, LuaRect>("bounds")
+                    .map_err(|inner| LuaError::CallbackError {
+                        traceback: "while reading SaveLayerRec bounds entry".to_string(),
+                        cause: Arc::new(inner),
+                    })?
+                    .into(),
+            );
         }
 
         if table.contains_key("paint")? {
@@ -1658,17 +2038,16 @@ impl<'a> std::ops::Deref for LuaCanvas<'a> {
 
 impl<'a> UserData for LuaCanvas<'a> {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
-        methods.add_method("clear", |_, this, (color,): (Option<LuaTable>,)| {
+        methods.add_method("clear", |_, this, (color,): (Option<LuaColor>,)| {
             let color = color
-                .map(read_color_table)
+                .map(LuaColor::into)
                 .unwrap_or(skia_safe::colors::TRANSPARENT);
             this.clear(color);
             Ok(())
         });
         methods.add_method(
             "drawColor",
-            |_, this, (color, blend_mode): (LuaTable, Option<String>)| {
-                let color = read_color_table(color);
+            |_, this, (color, blend_mode): (LuaColor, Option<String>)| {
                 let mode = match blend_mode {
                     Some(it) => Some(read_blend_mode(it)?),
                     None => None,
@@ -1681,37 +2060,27 @@ impl<'a> UserData for LuaCanvas<'a> {
             this.draw_paint(&paint);
             Ok(())
         });
-        methods.add_method(
-            "drawRect",
-            |_, this, (rect, paint): (LuaTable, LuaPaint)| {
-                let rect = read_rect_table(rect)?;
-                this.draw_rect(rect, &paint);
-                Ok(())
-            },
-        );
-        methods.add_method(
-            "drawOval",
-            |_, this, (oval, paint): (LuaTable, LuaPaint)| {
-                let oval = read_rect_table(oval)?;
-                this.draw_oval(oval, &paint);
-                Ok(())
-            },
-        );
+        methods.add_method("drawRect", |_, this, (rect, paint): (LuaRect, LuaPaint)| {
+            let rect: Rect = rect.into();
+            this.draw_rect(rect, &paint);
+            Ok(())
+        });
+        methods.add_method("drawOval", |_, this, (oval, paint): (LuaRect, LuaPaint)| {
+            let oval: Rect = oval.into();
+            this.draw_oval(oval, &paint);
+            Ok(())
+        });
         methods.add_method(
             "drawCircle",
             |_, this, (point, r, paint): (LuaPoint, f32, LuaPaint)| {
-                this.draw_circle(point.into_skia_point(), r, &paint);
+                this.draw_circle(point, r, &paint);
                 Ok(())
             },
         );
         methods.add_method(
             "drawImage",
             |_, this, (image, point, paint): (LuaImage, LuaPoint, Option<LuaPaint>)| {
-                this.draw_image(
-                    image.0,
-                    point.into_skia_point(),
-                    paint.map(|it| it.0).as_ref(),
-                );
+                this.draw_image(image.0, point, paint.map(|it| it.0).as_ref());
                 Ok(())
             },
         );
@@ -1721,8 +2090,8 @@ impl<'a> UserData for LuaCanvas<'a> {
              this,
              (image, src_rect, dst_rect, paint): (
                 LuaImage,
-                Option<LuaTable>,
-                LuaTable,
+                Option<LuaRect>,
+                LuaRect,
                 Option<LuaPaint>,
             )| {
                 let paint: Paint = match paint {
@@ -1730,10 +2099,10 @@ impl<'a> UserData for LuaCanvas<'a> {
                     None => Paint::default(),
                 };
                 let src_rect = match src_rect {
-                    Some(it) => Some(read_rect_table(it)?),
+                    Some(it) => Some(it.into()),
                     None => None,
                 };
-                let dst_rect = read_rect_table(dst_rect)?;
+                let dst_rect: Rect = dst_rect.into();
                 this.draw_image_rect(
                     image.0,
                     src_rect
@@ -1772,7 +2141,7 @@ impl<'a> UserData for LuaCanvas<'a> {
                     Some(colors) => {
                         let mut result = [Color::TRANSPARENT; 4];
                         for i in 0..4 {
-                            result[i] = read_color_table(colors.get(i)?).to_color();
+                            result[i] = colors.get::<usize, LuaColor>(i)?.into();
                         }
                         Some(result)
                     }
@@ -1805,7 +2174,7 @@ impl<'a> UserData for LuaCanvas<'a> {
         methods.add_method(
             "drawTextBlob",
             |_, this, (blob, point, paint): (LuaTextBlob, LuaPoint, LuaPaint)| {
-                this.draw_text_blob(blob.0, point.into_skia_point(), &paint);
+                this.draw_text_blob(blob.0, point, &paint);
                 Ok(())
             },
         );
@@ -1819,7 +2188,7 @@ impl<'a> UserData for LuaCanvas<'a> {
         methods.add_method("save", |_, this, ()| Ok(this.save()));
         methods.add_method(
             "saveLayer",
-            |_, this, save_layer_rec: FromLuaSaveLayerRec| {
+            |_, this, save_layer_rec: LuaSaveLayerRec| {
                 Ok(this.save_layer(&save_layer_rec.to_skia_save_layer_rec()))
             },
         );
@@ -1837,13 +2206,13 @@ impl<'a> UserData for LuaCanvas<'a> {
             Ok(())
         });
         methods.add_method("translate", |_, this, point: LuaPoint| {
-            this.translate(point.into_skia_point());
+            this.translate(point);
             Ok(())
         });
         methods.add_method(
             "rotate",
             |_, this, (degrees, point): (f32, Option<LuaPoint>)| {
-                let point = point.map(LuaPoint::into_skia_point);
+                let point = point.map(LuaPoint::into);
                 this.rotate(degrees, point);
                 Ok(())
             },
@@ -1939,7 +2308,15 @@ impl UserData for LuaGfx {
             |_, _, (typeface, size): (LuaTypeface, Option<f32>)| {
                 Ok(LuaFont(Font::new(typeface.0, size)))
             },
-        )
+        );
+        methods.add_method("newColorSpace", |_, _, name: String| match name.as_ref() {
+            "srgb" => Ok(LuaColorSpace(ColorSpace::new_srgb())),
+            "srgb_linear" | "srgb-linear" => Ok(LuaColorSpace(ColorSpace::new_srgb_linear())),
+            other => Err(LuaError::RuntimeError(format!(
+                "unknown color space: {}",
+                other
+            ))),
+        });
     }
 }
 
