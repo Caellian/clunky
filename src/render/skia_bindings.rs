@@ -1494,6 +1494,26 @@ macro_rules! type_like_table {
     }
 }
 
+macro_rules! decl_constructors {
+    ($handle: ident: {$(
+        fn $name: ident ($($argn: ident: $argt: ty),*) -> _ $imp: block
+    )*}) => {
+        paste::paste! {
+            pub struct [<$handle Constructors>];
+
+            impl UserData for [<$handle Constructors>] {
+                fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+                    $(
+                        methods.add_method(
+                            stringify!([<$name:camel>]), |_, _, ($($argn),*,): ($($argt),*,)| $imp,
+                        );
+                    )*
+                }
+            }
+        }
+    };
+}
+
 pub trait StructToTable<'lua> {
     fn to_table(&self, ctx: LuaContext<'lua>) -> LuaResult<LuaTable<'lua>>;
 }
@@ -1873,57 +1893,41 @@ impl UserData for LuaPathEffect {
     }
 }
 
-pub struct PathEffectCtors;
-
-impl UserData for PathEffectCtors {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
-        methods.add_method(
-            "MakeSum",
-            |_, _, (first, second): (LuaPathEffect, LuaPathEffect)| {
-                Ok(LuaPathEffect(path_effect::PathEffect::sum(
-                    first.0, second.0,
-                )))
-            },
-        );
-        methods.add_method(
-            "MakeCompose",
-            |_, _, (outer, inner): (LuaPathEffect, LuaPathEffect)| {
-                Ok(LuaPathEffect(path_effect::PathEffect::compose(
-                    outer.0, inner.0,
-                )))
-            },
-        );
-        methods.add_method("MakeDash", |_, _, like_dash: LikeDashInfo| {
-            Ok(
-                skia_safe::dash_path_effect::new(&like_dash.intervals, like_dash.phase)
-                    .map(LuaPathEffect),
-            )
-        });
-        methods.add_method(
-            "MakeTrim",
-            |_, _, (start, stop, mode): (f32, f32, Option<String>)| {
-                let mode = match mode {
-                    Some(it) => Some(read_trim_mode(&it)?),
-                    None => None,
-                };
-                Ok(skia_safe::trim_path_effect::new(start, stop, mode).map(LuaPathEffect))
-            },
-        );
-        methods.add_method("MakeRadius", |_, _, radius: f32| {
-            Ok(skia_safe::corner_path_effect::new(radius).map(LuaPathEffect))
-        });
-        methods.add_method(
-            "MakeDiscrete",
-            |_, _, (length, dev, seed): (f32, f32, Option<u32>)| {
-                Ok(skia_safe::discrete_path_effect::new(length, dev, seed).map(LuaPathEffect))
-            },
-        );
-        methods.add_method("Make2DPath", |_, _, (width, mx): (f32, LuaMatrix)| {
-            let mx: Matrix = mx.into();
-            Ok(skia_safe::line_2d_path_effect::new(width, &mx).map(LuaPathEffect))
-        });
+decl_constructors!(PathEffect: {
+    fn make_sum(first: LuaPathEffect, second: LuaPathEffect) -> _ {
+        Ok(LuaPathEffect(path_effect::PathEffect::sum(
+            first.0, second.0,
+        )))
     }
-}
+    fn make_compose(outer: LuaPathEffect, inner: LuaPathEffect) -> _ {
+        Ok(LuaPathEffect(path_effect::PathEffect::compose(
+            outer.0, inner.0,
+        )))
+    }
+    fn make_dash(like_dash: LikeDashInfo)-> _ {
+        Ok(
+            skia_safe::dash_path_effect::new(&like_dash.intervals, like_dash.phase)
+                .map(LuaPathEffect),
+        )
+    }
+    fn make_trim(start: f32, stop: f32, mode: Option<String>) -> _ {
+        let mode = match mode {
+            Some(it) => Some(read_trim_mode(&it)?),
+            None => None,
+        };
+        Ok(skia_safe::trim_path_effect::new(start, stop, mode).map(LuaPathEffect))
+    }
+    fn make_radius(radius: f32) -> _ {
+        Ok(skia_safe::corner_path_effect::new(radius).map(LuaPathEffect))
+    }
+    fn make_discrete(length: f32, dev: f32, seed: Option<u32>) -> _ {
+        Ok(skia_safe::discrete_path_effect::new(length, dev, seed).map(LuaPathEffect))
+    }
+    fn make_2D_path(width: f32, mx: LuaMatrix) -> _ {
+        let mx: Matrix = mx.into();
+        Ok(skia_safe::line_2d_path_effect::new(width, &mx).map(LuaPathEffect))
+    }
+});
 
 #[derive(Clone)]
 pub enum LuaMatrix {
@@ -3778,15 +3782,21 @@ impl UserData for LuaGfx {
     }
 }
 
+macro_rules! global_constructors {
+    ($ctx: ident: $($t: ty),*) => {paste::paste!{
+        $({
+            let constructors = $ctx.create_userdata([<$t Constructors>])?;
+            $ctx.globals().set(stringify!($t), constructors)?;
+        })*
+    }};
+}
+
 #[allow(non_snake_case)]
 pub fn setup<'lua>(ctx: LuaContext<'lua>) -> Result<(), rlua::Error> {
     let gfx = ctx.create_userdata(LuaGfx)?;
     ctx.globals().set("Gfx", gfx)?;
 
-    {
-        let constructors = ctx.create_userdata(PathEffectCtors)?;
-        ctx.globals().set("PathEffect", constructors)?;
-    }
+    global_constructors!(ctx: PathEffect);
 
     Ok(())
 }
