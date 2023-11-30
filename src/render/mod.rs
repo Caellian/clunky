@@ -7,8 +7,7 @@ pub mod skia;
 pub use skia as frontend;
 
 use glam::{IVec2, UVec2};
-use parking_lot::Condvar;
-use wayland_client::{Connection, QueueHandle};
+use wayland_client::Connection;
 pub use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
 
 use crate::error::Result;

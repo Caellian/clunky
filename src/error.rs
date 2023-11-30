@@ -5,6 +5,9 @@ use std::{
 
 use thiserror::Error;
 
+pub(crate) type IOError = std::io::Error;
+pub type LuaError = rlua::Error;
+
 #[derive(Clone, Debug)]
 pub struct Detail(pub Option<String>);
 impl std::fmt::Display for Detail {

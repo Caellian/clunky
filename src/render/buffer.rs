@@ -82,6 +82,7 @@ impl FrameParameters {
 pub struct FrameBuffer {
     source: File,
     mmap: MmapMut,
+    params: FrameParameters,
 
     wl_pool: WlShmPool,
     wl_buffer: WlBuffer,
@@ -111,6 +112,7 @@ impl FrameBuffer {
         Ok(FrameBuffer {
             source,
             mmap,
+            params,
             wl_pool: pool,
             wl_buffer: buffer,
         })
@@ -147,6 +149,7 @@ impl FrameBuffer {
             &qh,
             (),
         );
+        self.params = params;
         Ok(())
     }
 
@@ -156,6 +159,10 @@ impl FrameBuffer {
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.mmap
+    }
+
+    pub fn frame_parameters(&self) -> FrameParameters {
+        self.params
     }
 }
 

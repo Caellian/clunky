@@ -1,14 +1,16 @@
 use std::{
     alloc::Layout,
-    default,
+    collections::{HashMap, VecDeque},
+    ffi::CString,
     mem::{align_of, size_of},
     sync::{Arc, OnceLock},
 };
 
 use phf::phf_map;
-use rlua::{prelude::*, Context as LuaContext, Table as LuaTable, UserData, Variadic};
+use rlua::{prelude::*, Context as LuaContext, Table as LuaTable, UserData};
 use skia_safe::{
     canvas::{self, SaveLayerFlags, SaveLayerRec},
+    font::Edging as FontEdging,
     font_style::{Slant, Weight, Width},
     image_filter::MapDirection,
     image_filters::{self, CropRect},
@@ -16,6 +18,7 @@ use skia_safe::{
     paint::{Cap as PaintCap, Join as PaintJoin},
     path::{AddPathMode, ArcSize, SegmentMask, Verb},
     path_effect::DashInfo,
+    rrect::{Corner as RRectCorner, Type as RRectType},
     stroke_rec::{InitStyle as StrokeRecInitStyle, Style as StrokeRecStyle},
     *,
 };
@@ -218,6 +221,41 @@ enum_naming! { PixelGeometry: [
     PixelGeometry::BGRV => "bgrv",
 ]}
 
+enum_naming! { FontEdging: [
+    FontEdging::Alias => "alias",
+    FontEdging::AntiAlias => "anti_alias",
+    FontEdging::SubpixelAntiAlias => "subpixel_anti_alias",
+]}
+
+enum_naming! { FontHinting: [
+    FontHinting::None => "none",
+    FontHinting::Slight => "slight",
+    FontHinting::Normal => "normal",
+    FontHinting::Full => "full",
+]}
+
+enum_naming! { TextEncoding: [
+    TextEncoding::UTF8 => "utf8",
+    TextEncoding::UTF16 => "utf16",
+    TextEncoding::UTF32 => "utf32",
+]}
+
+enum_naming! { RRectType: [
+    RRectType::Empty => "empty",
+    RRectType::Rect => "rect",
+    RRectType::Oval => "oval",
+    RRectType::Simple => "simple",
+    RRectType::NinePatch => "nine_patch",
+    RRectType::Complex => "complex",
+]}
+
+enum_naming! { RRectCorner: [
+    RRectCorner::UpperLeft => "upper_left",
+    RRectCorner::UpperRight => "upper_right",
+    RRectCorner::LowerRight => "lower_right",
+    RRectCorner::LowerLeft => "lower_left",
+]}
+
 macro_rules! named_bitflags {
     ($kind: ty: [$($value: expr => $name: literal,)+]) => {paste::paste!{
         enum_naming! { $kind : [
@@ -362,10 +400,10 @@ impl<'lua> FromLua<'lua> for LuaColor {
         match len {
             0 => Ok(LuaColor::default()),
             3 | 4 => {
-                let r = color.get(0 as i64).map_err(|_| unknown_format())?;
-                let g = color.get(1 as i64).map_err(|_| unknown_format())?;
-                let b = color.get(2 as i64).map_err(|_| unknown_format())?;
-                let a = color.get(3 as i64).unwrap_or(1.);
+                let r = color.get(1 as LuaInteger).map_err(|_| unknown_format())?;
+                let g = color.get(2 as LuaInteger).map_err(|_| unknown_format())?;
+                let b = color.get(3 as LuaInteger).map_err(|_| unknown_format())?;
+                let a = color.get(4 as LuaInteger).unwrap_or(1.);
                 Ok(LuaColor { r, g, b, a })
             }
             _ => Err(unknown_format()),
@@ -1007,6 +1045,243 @@ impl From<(Point, Point)> for LuaLine {
     }
 }
 
+pub struct SidePack {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl<'lua> FromLuaMulti<'lua> for SidePack {
+    fn from_lua_multi(
+        values: LuaMultiValue<'lua>,
+        _: LuaContext<'lua>,
+        consumed: &mut usize,
+    ) -> LuaResult<Self> {
+        let mut values = values.into_iter();
+
+        #[inline(always)]
+        fn bad_argument_count() -> LuaError {
+            LuaError::FromLuaConversionError {
+                from: "...",
+                to: "Side",
+                message: Some("Side requires 2 (vertical, horizontal), 4 (left, top, right, bottom) arguments, or a table with those values".to_string()),
+            }
+        }
+
+        let first = values.next().ok_or_else(|| LuaError::CallbackError {
+            traceback: "expected a Side argument pack or table".to_string(),
+            cause: Arc::new(LuaError::FromLuaConversionError {
+                from: "nil",
+                to: "Side",
+                message: Some("Side parameters missing".to_string()),
+            }),
+        })?;
+
+        match first {
+            LuaValue::Table(table) => {
+                *consumed += 1;
+                Self::try_from(table)
+            }
+            LuaValue::Integer(_) | LuaValue::Number(_) => {
+                let mut numbers = Vec::with_capacity(4);
+                numbers.push(match first {
+                    LuaValue::Integer(it) => it as f32,
+                    LuaValue::Number(it) => it as f32,
+                    _ => unreachable!(),
+                });
+                numbers.extend(
+                    values
+                        .take(3)
+                        .map(|it| match it {
+                            LuaValue::Integer(it) => Some(it as f32),
+                            LuaValue::Number(it) => Some(it as f32),
+                            _ => None,
+                        })
+                        .take_while(Option::is_some)
+                        .filter_map(|it| it),
+                );
+
+                match numbers.len() {
+                    1 => unsafe {
+                        // SAFETY: numbers length checked by outer match
+                        let all = *numbers.get(0).unwrap_unchecked();
+                        *consumed += 1;
+                        Ok(SidePack {
+                            left: all,
+                            top: all,
+                            right: all,
+                            bottom: all,
+                        })
+                    },
+                    2 | 3 => unsafe {
+                        // SAFETY: numbers length checked by outer match
+                        let vertical = *numbers.get(0).unwrap_unchecked();
+                        let horizontal = *numbers.get(1).unwrap_unchecked();
+                        *consumed += 2;
+                        Ok(SidePack {
+                            left: horizontal,
+                            top: vertical,
+                            right: horizontal,
+                            bottom: vertical,
+                        })
+                    },
+                    _ => unsafe {
+                        // SAFETY: numbers length checked by outer match
+                        let left = *numbers.get(0).unwrap_unchecked();
+                        let top = *numbers.get(1).unwrap_unchecked();
+                        let right = *numbers.get(2).unwrap_unchecked();
+                        let bottom = *numbers.get(3).unwrap_unchecked();
+                        *consumed += 4;
+                        Ok(SidePack {
+                            left,
+                            top,
+                            right,
+                            bottom,
+                        })
+                    },
+                }
+            }
+            _ => Err(bad_argument_count()),
+        }
+    }
+}
+
+impl<'lua> TryFrom<LuaTable<'lua>> for SidePack {
+    type Error = LuaError;
+
+    fn try_from(table: LuaTable<'lua>) -> Result<Self, Self::Error> {
+        {
+            let left: Option<f32> = table.get("left").or_else(|_| table.get("l")).ok();
+            let top: Option<f32> = table.get("top").or_else(|_| table.get("t")).ok();
+            let right: Option<f32> = table.get("right").or_else(|_| table.get("r")).ok();
+            let bottom: Option<f32> = table.get("bottom").or_else(|_| table.get("b")).ok();
+
+            let is_explicit =
+                left.is_some() || top.is_some() || right.is_some() || bottom.is_some();
+            if is_explicit {
+                return Ok(SidePack {
+                    left: left.unwrap_or_default(),
+                    top: top.unwrap_or_default(),
+                    right: right.unwrap_or_default(),
+                    bottom: bottom.unwrap_or_default(),
+                });
+            }
+        }
+
+        {
+            let vertical: Option<f32> = table.get("vertical").or_else(|_| table.get("v")).ok();
+            let horizontal: Option<f32> = table.get("horizontal").or_else(|_| table.get("h")).ok();
+            let is_symmetrical = vertical.is_some() || horizontal.is_some();
+            if is_symmetrical {
+                return Ok(SidePack {
+                    left: horizontal.unwrap_or_default(),
+                    top: vertical.unwrap_or_default(),
+                    right: horizontal.unwrap_or_default(),
+                    bottom: vertical.unwrap_or_default(),
+                });
+            }
+        }
+
+        {
+            let all: Option<f32> = table.get("all").or_else(|_| table.get("a")).ok();
+            if let Some(all) = all {
+                return Ok(SidePack {
+                    left: all,
+                    top: all,
+                    right: all,
+                    bottom: all,
+                });
+            }
+        }
+
+        let mut values: VecDeque<Result<_, _>> = table.sequence_values::<f32>().collect();
+
+        match values.len() {
+            1 => unsafe {
+                // SAFETY: Length of values is checked by outer match
+                let all = values.pop_front().unwrap_unchecked().map_err(|inner| {
+                    LuaError::CallbackError {
+                        traceback: "reading Side 'all' length".to_string(),
+                        cause: Arc::new(inner),
+                    }
+                })?;
+
+                Ok(SidePack {
+                    left: all,
+                    top: all,
+                    right: all,
+                    bottom: all,
+                })
+            },
+            2 => unsafe {
+                // SAFETY: Length of values is checked by outer match
+                let v = values.pop_front().unwrap_unchecked().map_err(|inner| {
+                    LuaError::CallbackError {
+                        traceback: "reading Side 'vertical' length".to_string(),
+                        cause: Arc::new(inner),
+                    }
+                })?;
+                let h = values.pop_front().unwrap_unchecked().map_err(|inner| {
+                    LuaError::CallbackError {
+                        traceback: "reading Side 'horizontal' length".to_string(),
+                        cause: Arc::new(inner),
+                    }
+                })?;
+
+                Ok(SidePack {
+                    left: h,
+                    top: v,
+                    right: h,
+                    bottom: v,
+                })
+            },
+            4 => unsafe {
+                // SAFETY: Length of values is checked by outer match
+                let left = values.pop_front().unwrap_unchecked().map_err(|inner| {
+                    LuaError::CallbackError {
+                        traceback: "reading Side 'left' length".to_string(),
+                        cause: Arc::new(inner),
+                    }
+                })?;
+                let top = values.pop_front().unwrap_unchecked().map_err(|inner| {
+                    LuaError::CallbackError {
+                        traceback: "reading Side 'top' length".to_string(),
+                        cause: Arc::new(inner),
+                    }
+                })?;
+                let right = values.pop_front().unwrap_unchecked().map_err(|inner| {
+                    LuaError::CallbackError {
+                        traceback: "reading Side 'right' length".to_string(),
+                        cause: Arc::new(inner),
+                    }
+                })?;
+                let bottom = values.pop_front().unwrap_unchecked().map_err(|inner| {
+                    LuaError::CallbackError {
+                        traceback: "reading Side 'bottom' length".to_string(),
+                        cause: Arc::new(inner),
+                    }
+                })?;
+
+                Ok(SidePack {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                })
+            },
+            other_len => Err(LuaError::FromLuaConversionError {
+                from: "table",
+                to: "Side",
+                message: Some(format!(
+                    "invalid Side table array value count, expected exactly 1, 2 or 4; got: {}",
+                    other_len
+                )),
+            }),
+        }
+    }
+}
+
 macro_rules! wrap_skia_handle {
     ($handle: ty) => {
         paste::paste! {
@@ -1103,6 +1378,38 @@ macro_rules! type_like_table {
         type_like_table!($handle: |$ident: LuaTable, _unused_lua_ctx: LuaContext| $body);
     }
 }
+
+pub trait StructToTable<'lua> {
+    fn to_table(&self, ctx: LuaContext<'lua>) -> LuaResult<LuaTable<'lua>>;
+}
+
+macro_rules! struct_to_table {
+    ($ty: ident : {$($name: literal: |$this: ident, $ctx: tt| $access: expr),+ $(,)?}) => {
+        impl<'lua> StructToTable<'lua> for $ty {paste::paste!{
+            fn to_table(&self, ctx: LuaContext<'lua>) -> LuaResult<LuaTable<'lua>> {
+                let result = ctx.create_table()?;
+                $(
+                    result.set($name, (|$this: &$ty, $ctx: &LuaContext| $access)(self, &ctx))?;
+                )+
+                Ok(result)
+            }
+        }}
+    };
+}
+
+struct_to_table! { FontMetrics: {
+    "top": |metrics, _| metrics.top,
+    "ascent": |metrics, _| metrics.ascent,
+    "descent": |metrics, _| metrics.descent,
+    "bottom": |metrics, _| metrics.bottom,
+    "leading": |metrics, _| metrics.leading,
+    "avg_char_width": |metrics, _| metrics.avg_char_width,
+    "max_char_width": |metrics, _| metrics.max_char_width,
+    "x_min": |metrics, _| metrics.x_min,
+    "x_max": |metrics, _| metrics.x_max,
+    "x_height": |metrics, _| metrics.x_height,
+    "cap_height": |metrics, _| metrics.cap_height,
+}}
 
 wrap_skia_handle!(Shader);
 
@@ -2215,12 +2522,137 @@ impl UserData for LuaPath {
 wrap_skia_handle!(RRect);
 
 impl UserData for LuaRRect {
-    // TODO: https://api.skia.org/classSkRRect.html
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method("contains", |_, this, rect: LuaRect| {
+            let rect: Rect = rect.into();
+            Ok(this.contains(rect))
+        });
+        methods.add_method("getBounds", |_, this, ()| {
+            Ok(LuaRect::from(this.bounds().clone()))
+        });
+        methods.add_method("getSimpleRadii", |_, this, ()| {
+            Ok(LuaPoint::from(this.simple_radii()))
+        });
+        methods.add_method("getType", |_, this, ()| {
+            Ok(r_rect_type_name(this.get_type()))
+        });
+        methods.add_method("height", |_, this, ()| Ok(this.height()));
+        methods.add_method_mut("inset", |_, this, delta: LuaPoint| {
+            this.inset(delta);
+            Ok(())
+        });
+        methods.add_method("isComplex", |_, this, ()| Ok(this.is_complex()));
+        methods.add_method("isEmpty", |_, this, ()| Ok(this.is_empty()));
+        methods.add_method("isNinePatch", |_, this, ()| Ok(this.is_nine_patch()));
+        methods.add_method("isOval", |_, this, ()| Ok(this.is_oval()));
+        methods.add_method("isRect", |_, this, ()| Ok(this.is_rect()));
+        methods.add_method("isSimple", |_, this, ()| Ok(this.is_simple()));
+        methods.add_method("isValid", |_, this, ()| Ok(this.is_valid()));
+        methods.add_method("makeOffset", |_, this, delta: LuaPoint| {
+            Ok(LuaRRect(this.with_offset(delta)))
+        });
+        methods.add_method_mut("offset", |_, this, delta: LuaPoint| {
+            this.offset(delta);
+            Ok(())
+        });
+        methods.add_method_mut("outset", |_, this, delta: LuaPoint| {
+            this.outset(delta);
+            Ok(())
+        });
+        methods.add_method("radii", |_, this, corner: Option<String>| {
+            let radii = match corner {
+                Some(it) => this.radii(read_r_rect_corner(it)?),
+                None => this.simple_radii(),
+            };
+            Ok(LuaPoint::from(radii))
+        });
+        methods.add_method("rect", |_, this, ()| Ok(LuaRect::from(this.rect().clone())));
+        methods.add_method_mut("setEmpty", |_, this, ()| {
+            this.set_empty();
+            Ok(())
+        });
+        methods.add_method_mut(
+            "setNinePatch",
+            |_, this, (rect, sides): (LuaRect, SidePack)| {
+                let rect: Rect = rect.into();
+                this.set_nine_patch(rect, sides.left, sides.top, sides.right, sides.bottom);
+                Ok(())
+            },
+        );
+        methods.add_method_mut("setOval", |_, this, oval: LuaRect| {
+            let oval: Rect = oval.into();
+            this.set_oval(oval);
+            Ok(())
+        });
+        methods.add_method_mut("setRect", |_, this, rect: LuaRect| {
+            let rect: Rect = rect.into();
+            this.set_rect(rect);
+            Ok(())
+        });
+        methods.add_method_mut(
+            "setRectRadii",
+            |_, this, (rect, radii): (LuaRect, Vec<LuaPoint>)| {
+                let rect: Rect = rect.into();
+                if radii.len() < 4 {
+                    // TODO: Take exactly 4 LuaPoints, maybe unpacked
+                    return Err(LuaError::RuntimeError(format!(
+                        "RRect:setRectRadii expects 4 radii points; got {}",
+                        radii.len()
+                    )));
+                }
+                let radii: Vec<Point> = radii.into_iter().take(4).map(LuaPoint::into).collect();
+                let radii: [Point; 4] = radii.try_into().expect("radii should have 4 Points");
+                this.set_rect_radii(rect, &radii);
+                Ok(())
+            },
+        );
+        methods.add_method_mut(
+            "setRectXY",
+            |_, this, (rect, x_rad, y_rad): (LuaRect, f32, f32)| {
+                let rect: Rect = rect.into();
+                this.set_rect_xy(rect, x_rad, y_rad);
+                Ok(())
+            },
+        );
+        methods.add_method("transform", |_, this, matrix: LuaMatrix| {
+            let matrix: Matrix = matrix.into();
+            Ok(this.transform(&matrix).map(LuaRRect))
+        });
+        methods.add_method("type", |_, this, ()| Ok(r_rect_type_name(this.get_type())));
+        methods.add_method("width", |_, this, ()| Ok(this.width()));
+    }
 }
 
 wrap_skia_handle!(ImageInfo);
 impl UserData for LuaImageInfo {
-    // TODO: https://api.skia.org/classSkImageInfo.html
+    /* TODO: https://api.skia.org/classSkImageInfo.html
+    alphaType
+    bounds
+    bytesPerPixel
+    colorInfo
+    colorSpace
+    colorType
+    computeByteSize
+    computeMinByteSize
+    computeOffset
+    dimensions
+    gammaCloseToSRGB
+    height
+    isEmpty
+    isOpaque
+    makeAlphaType
+    makeColorSpace
+    makeColorType
+    makeDimensions
+    makeWH
+    minRowBytes
+    minRowBytes64
+    refColorSpace
+    reset
+    shiftPerPixel
+    validRowBytes
+    width
+    */
 }
 
 type_like_table!(ImageInfo: |value: LuaTable| {
@@ -2247,7 +2679,18 @@ type_like_table!(ImageInfo: |value: LuaTable| {
 
 wrap_skia_handle!(SurfaceProps);
 impl UserData for LuaSurfaceProps {
-    // TODO: https://api.skia.org/classSkSurfaceProps.html
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method("flags", |ctx, this, ()| {
+            write_surface_props_flags_table(ctx, this.flags())
+        });
+        methods.add_method("pixelGeometry", |_, this, ()| {
+            Ok(pixel_geometry_name(this.pixel_geometry()))
+        });
+        methods.add_method("isUseDeviceIndependentFonts", |_, this, ()| {
+            Ok(this.is_use_device_independent_fonts())
+        });
+        methods.add_method("isAlwaysDither", |_, this, ()| Ok(this.is_always_dither()));
+    }
 }
 
 type_like_table!(SurfaceProps: |value: LuaTable| {
@@ -2266,7 +2709,25 @@ type_like_table!(SurfaceProps: |value: LuaTable| {
 wrap_skia_handle!(Surface);
 
 impl UserData for LuaSurface {
-    // TODO: https://api.skia.org/classSkSurface.html
+    /* TODO: https://api.skia.org/classSkSurface.html
+    capabilities
+    characterize
+    draw
+    getCanvas
+    height
+    imageInfo
+    isCompatible
+    makeImageSnapshot
+    makeSurface
+    peekPixels
+    props
+    readPixels
+    recorder
+    recordingContext
+    replaceBackendTexture
+    width
+    writePixels
+    */
 }
 
 unsafe impl Send for LuaSurface {}
@@ -2274,7 +2735,34 @@ unsafe impl Send for LuaSurface {}
 wrap_skia_handle!(Typeface);
 
 impl UserData for LuaTypeface {
-    // TODO: https://api.skia.org/classSkTypeface.html
+    /* TODO: https://api.skia.org/classSkTypeface.html
+    countGlyphs
+    countTables
+    createFamilyNameIterator
+    createScalerContext
+    filterRec
+    fontStyle
+    getBounds
+    getFamilyName
+    getFontDescriptor
+    getKerningPairAdjustments
+    getPostScriptName
+    getTableData
+    getTableSize
+    getTableTags
+    getUnitsPerEm
+    getVariationDesignParameters
+    getVariationDesignPosition
+    isBold
+    isFixedPitch
+    isItalic
+    makeClone
+    openExistingStream
+    openStream
+    textToGlyphs
+    unicharsToGlyphs
+    unicharToGlyph
+    */
 }
 
 #[derive(Clone, Copy)]
@@ -2426,7 +2914,206 @@ impl UserData for LuaFontStyle {
 wrap_skia_handle!(Font);
 
 impl UserData for LuaFont {
-    // TODO: https://api.skia.org/classSkFont.html
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method(
+            "countText",
+            |_, this, (text, encoding): (CString, Option<String>)| {
+                let encoding = read_text_encoding(encoding.unwrap_or("utf8".to_string()))?;
+                Ok(this.count_text(text.as_bytes(), encoding))
+            },
+        );
+        methods.add_method(
+            "getBounds",
+            |_, this, (glyphs, paint): (Vec<GlyphId>, Option<LuaPaint>)| {
+                let mut bounds = [Rect::new_empty()].repeat(glyphs.len());
+                this.get_bounds(&glyphs, &mut bounds, paint.map(LuaPaint::unwrap).as_ref());
+                let bounds: Vec<LuaRect> = bounds.into_iter().map(LuaRect::from).collect();
+                Ok(bounds)
+            },
+        );
+        methods.add_method("getEdging", |_, this, ()| {
+            Ok(font_edging_name(this.edging()))
+        });
+        methods.add_method("getHinting", |_, this, ()| {
+            Ok(font_hinting_name(this.hinting()))
+        });
+        methods.add_method(
+            "getIntercepts",
+            |_,
+             this,
+             (glyphs, points, top, bottom, paint): (
+                Vec<GlyphId>,
+                Vec<LuaPoint>,
+                f32,
+                f32,
+                Option<LuaPaint>,
+            )| {
+                let points: Vec<Point> = points.into_iter().map(|it| it.into()).collect();
+                let paint = paint.map(|it| it.0);
+                let intercepts =
+                    this.get_intercepts(&glyphs, &points, (top, bottom), paint.as_ref());
+                Ok(intercepts)
+            },
+        );
+        methods.add_method("getMetrics", |ctx, this, ()| this.metrics().1.to_table(ctx));
+        methods.add_method("getPath", |_, this, glyph: GlyphId| {
+            Ok(this.get_path(glyph).map(LuaPath))
+        });
+        methods.add_method("getPaths", |_, this, glyphs: Vec<GlyphId>| {
+            Ok(glyphs
+                .into_iter()
+                .filter_map(|it| this.get_path(it).map(LuaPath).map(|b| (it, b)))
+                .collect::<HashMap<GlyphId, LuaPath>>())
+        });
+        methods.add_method(
+            "getPos",
+            |_, this, (glyphs, origin): (Vec<GlyphId>, Option<LuaPoint>)| {
+                let mut points = [Point::new(0., 0.)].repeat(glyphs.len());
+                let origin = origin.map(LuaPoint::into);
+                this.get_pos(&glyphs, &mut points, origin);
+                let points: Vec<_> = points.into_iter().map(LuaPoint::from).collect();
+                Ok(points)
+            },
+        );
+        methods.add_method("getScaleX", |_, this, ()| Ok(this.scale_x()));
+        methods.add_method("getSize", |_, this, ()| Ok(this.size()));
+        methods.add_method("getSkewX", |_, this, ()| Ok(this.skew_x()));
+        methods.add_method("getSpacing", |_, this, ()| Ok(this.spacing()));
+        methods.add_method("getTypeface", |_, this, ()| {
+            Ok(this.typeface().map(LuaTypeface))
+        });
+        methods.add_method("getWidths", |_, this, glyphs: Vec<GlyphId>| {
+            let mut widths = Vec::with_capacity(glyphs.len());
+            this.get_widths(&glyphs, &mut widths);
+            Ok(widths)
+        });
+        methods.add_method(
+            "getWidthsBounds",
+            |ctx, this, (glyphs, paint): (Vec<GlyphId>, Option<LuaPaint>)| {
+                let mut widths = Vec::with_capacity(glyphs.len());
+                let mut bounds = Vec::with_capacity(glyphs.len());
+                this.get_widths_bounds(
+                    &glyphs,
+                    Some(&mut widths),
+                    Some(&mut bounds),
+                    paint.map(LuaPaint::unwrap).as_ref(),
+                );
+                let result = ctx.create_table()?;
+                result.set("widths", widths)?;
+                result.set(
+                    "bounds",
+                    bounds.into_iter().map(LuaRect::from).collect::<Vec<_>>(),
+                )?;
+                Ok(result)
+            },
+        );
+        methods.add_method(
+            "getXPos",
+            |_, this, (glyphs, origin): (Vec<GlyphId>, Option<f32>)| {
+                let mut result = Vec::with_capacity(glyphs.len());
+                this.get_x_pos(&glyphs, &mut result, origin);
+                Ok(result)
+            },
+        );
+        methods.add_method("isBaselineSnap", |_, this, ()| Ok(this.is_baseline_snap()));
+        methods.add_method("isEmbeddedBitmaps", |_, this, ()| {
+            Ok(this.is_embedded_bitmaps())
+        });
+        methods.add_method("isEmbolden", |_, this, ()| Ok(this.is_embolden()));
+        methods.add_method("isForceAutoHinting", |_, this, ()| {
+            Ok(this.is_force_auto_hinting())
+        });
+        methods.add_method(
+            "isLinearMetrics",
+            |_, this, ()| Ok(this.is_linear_metrics()),
+        );
+        methods.add_method("isSubpixel", |_, this, ()| Ok(this.is_subpixel()));
+        methods.add_method("makeWithSize", |_, this, size: f32| {
+            Ok(this.with_size(size).map(LuaFont))
+        });
+        methods.add_method(
+            "measureText",
+            |_, this, (text, encoding, paint): (CString, Option<String>, Option<LuaPaint>)| {
+                let encoding = read_text_encoding(encoding.unwrap_or("utf8".to_string()))?;
+                Ok(this
+                    .measure_text(
+                        text.to_bytes(),
+                        encoding,
+                        paint.map(LuaPaint::unwrap).as_ref(),
+                    )
+                    .0)
+            },
+        );
+        methods.add_method_mut("setBaselineSnap", |_, this, baseline_snap: bool| {
+            this.set_baseline_snap(baseline_snap);
+            Ok(())
+        });
+        methods.add_method_mut("setEdging", |_, this, edging: String| {
+            let edging = read_font_edging(edging)?;
+            this.set_edging(edging);
+            Ok(())
+        });
+        methods.add_method_mut("setEmbeddedBitmaps", |_, this, embedded_bitmaps: bool| {
+            this.set_embedded_bitmaps(embedded_bitmaps);
+            Ok(())
+        });
+        methods.add_method_mut("setEmbolden", |_, this, embolden: bool| {
+            this.set_embolden(embolden);
+            Ok(())
+        });
+        methods.add_method_mut(
+            "setForceAutoHinting",
+            |_, this, force_auto_hinting: bool| {
+                this.set_force_auto_hinting(force_auto_hinting);
+                Ok(())
+            },
+        );
+        methods.add_method_mut("setHinting", |_, this, hinting: String| {
+            let font_hinting = read_font_hinting(hinting)?;
+            this.set_hinting(font_hinting);
+            Ok(())
+        });
+        methods.add_method_mut("setLinearMetrics", |_, this, linear_metrics: bool| {
+            this.set_linear_metrics(linear_metrics);
+            Ok(())
+        });
+        methods.add_method_mut("setScaleX", |_, this, scale: f32| {
+            this.set_scale_x(scale);
+            Ok(())
+        });
+        methods.add_method_mut("setSize", |_, this, size: f32| {
+            this.set_size(size);
+            Ok(())
+        });
+        methods.add_method_mut("setSkewX", |_, this, skew: f32| {
+            this.set_skew_x(skew);
+            Ok(())
+        });
+        methods.add_method_mut("setSubpixel", |_, this, subpixel: bool| {
+            this.set_subpixel(subpixel);
+            Ok(())
+        });
+        methods.add_method_mut("setTypeface", |_, this, typeface: LuaTypeface| {
+            this.set_typeface(typeface.unwrap());
+            Ok(())
+        });
+        methods.add_method(
+            "textToGlyphs",
+            |_, this, (text, encoding): (CString, Option<String>)| {
+                let encoding = read_text_encoding(encoding.unwrap_or("utf8".to_string()))?;
+                this.text_to_glyphs_vec(text.as_bytes(), encoding);
+                Ok(())
+            },
+        );
+        methods.add_method("unicharsToGlyphs", |_, this, unichars: Vec<Unichar>| {
+            let mut result = Vec::with_capacity(unichars.len());
+            this.unichar_to_glyphs(&unichars, &mut result);
+            Ok(result)
+        });
+        methods.add_method("unicharToGlyph", |_, this, unichar: Unichar| {
+            Ok(this.unichar_to_glyph(unichar))
+        });
+    }
 }
 
 wrap_skia_handle!(TextBlob);
@@ -2636,29 +3323,27 @@ impl<'a> UserData for LuaCanvas<'a> {
             |_,
              this,
              (cubics_table, colors, tex_coords, blend_mode, paint): (
-                LuaTable,
-                Option<LuaTable>,
-                Option<LuaTable>,
+                Vec<LuaPoint>,
+                Option<Vec<LuaColor>>,
+                Option<Vec<LuaPoint>>,
                 String,
                 LikePaint,
             )| {
-                if cubics_table.len()? != 24 {
+                if cubics_table.len() != 12 {
                     return Err(LuaError::RuntimeError(
                         "expected 12 cubic points".to_string(),
                     ));
                 }
                 let mut cubics = [Point::new(0.0, 0.0); 12];
                 for i in 0..12 {
-                    let x: f32 = cubics_table.get(i as i64 * 2)?;
-                    let y: f32 = cubics_table.get(i as i64 * 2 + 1)?;
-                    cubics[i] = Point::new(x, y);
+                    cubics[i] = cubics_table[i].into();
                 }
 
                 let colors = match colors {
                     Some(colors) => {
                         let mut result = [Color::TRANSPARENT; 4];
                         for i in 0..4 {
-                            result[i] = colors.get::<usize, LuaColor>(i)?.into();
+                            result[i] = colors[i].into();
                         }
                         Some(result)
                     }
@@ -2667,11 +3352,14 @@ impl<'a> UserData for LuaCanvas<'a> {
 
                 let tex_coords = match tex_coords {
                     Some(coords) => {
+                        if coords.len() != 4 {
+                            return Err(LuaError::RuntimeError(
+                                "expected 4 texture coordinates".to_string(),
+                            ));
+                        }
                         let mut result = [Point::new(0.0, 0.0); 4];
                         for i in 0..4 {
-                            let x: f32 = coords.get(i as i64 * 2)?;
-                            let y: f32 = coords.get(i as i64 * 2 + 1)?;
-                            result[i] = Point::new(x, y);
+                            result[i] = coords[i].into();
                         }
                         Some(result)
                     }

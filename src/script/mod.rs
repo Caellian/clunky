@@ -1,15 +1,12 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use crate::{
-    error::{ClunkyError, Detail, Result},
-    settings::Settings,
-};
+use crate::error::Result;
 use rlua::*;
+use settings::Settings;
 
-static LAYOUT_FN: &str = "layout";
+pub mod data;
+pub mod events;
+pub mod settings;
 
 pub struct ScriptContext {
     source: PathBuf,
@@ -44,26 +41,13 @@ impl ScriptContext {
                 }
             }
 
+            crate::render::frontend::bindings::setup(lua_ctx)?;
+
             lua_ctx
                 .load(&init_script)
                 .set_name(path.as_ref().to_str().unwrap_or("user script"))
                 .expect("invalid user script")
                 .exec()?;
-
-            /*
-                let add_component_fn = lua_ctx
-                    .create_function(bindings::add_component)
-                    .expect("invalid add_component binding");
-                g.set("add_component", add_component_fn)?;
-
-
-
-                let layout_fn: Function = g
-                    .get(LAYOUT_FN)
-                    .expect(&format!("user script has no {} function", LAYOUT_FN));
-                Ok(lua_ctx.create_registry_value(layout_fn)?)
-            */
-            crate::render::frontend::bindings::setup(lua_ctx)?;
             Ok(())
         })?;
 
@@ -74,13 +58,19 @@ impl ScriptContext {
     }
 
     pub fn load_settings(&self) -> Settings {
-        self.lua.context(|lua_ctx| {
+        let load_result = self.lua.context(|lua_ctx| {
             lua_ctx
                 .globals()
                 .get("settings")
-                .map(|it| Settings::load(lua_ctx, it))
-                .unwrap_or_default()
-        })
+                .and_then(|it| Settings::load(lua_ctx, it))
+        });
+
+        match load_result {
+            Ok(it) => it,
+            Err(err) => {
+                panic!("unable to load settings: {}", err)
+            }
+        }
     }
 
     pub fn lua(&self) -> &Lua {
@@ -103,20 +93,4 @@ pub fn lua_is_eq<'lua, A: ToLua<'lua>, B: ToLua<'lua>>(ctx: &Context<'lua>, a: A
         .eval()
         .expect("invalid check expression");
     check.call((a, b)).unwrap_or_default()
-}
-
-pub fn lua_get_table_key<'lua, K: FromLua<'lua>, V: ToLua<'lua> + FromLua<'lua> + Clone>(
-    ctx: &Context<'lua>,
-    table: Table<'lua>,
-    value: &V,
-) -> Option<K> {
-    for entry in table.pairs::<K, V>() {
-        if let Ok((k, v)) = entry {
-            if lua_is_eq(ctx, value.clone(), v) {
-                return Some(k);
-            }
-        }
-    }
-
-    None
 }

@@ -1,24 +1,11 @@
-use std::{
-    fs::File,
-    hash::BuildHasher,
-    os::fd::{AsFd, AsRawFd},
-    thread::sleep,
-};
-
 use glam::{IVec2, UVec2};
-use image::{buffer, Frame};
-use parking_lot::Condvar;
-use skia_safe::luma_color_filter::new;
 use wayland_client::{
     protocol::{
-        wl_buffer::{self, WlBuffer},
-        wl_callback, wl_compositor,
+        wl_buffer, wl_callback, wl_compositor,
         wl_keyboard::{self, KeyState, WlKeyboard},
         wl_pointer::{self, WlPointer},
         wl_registry::{self, WlRegistry},
-        wl_seat,
-        wl_shm::{self, WlShm},
-        wl_shm_pool::{self, WlShmPool},
+        wl_seat, wl_shm, wl_shm_pool,
         wl_surface::{self, WlSurface},
     },
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
@@ -468,9 +455,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
         match event {
             wl_pointer::Event::Enter { .. } => {}
             wl_pointer::Event::Leave { .. } => {}
-            wl_pointer::Event::Motion { .. } => {
-                log::info!("movement event");
-            }
+            wl_pointer::Event::Motion { .. } => {}
             wl_pointer::Event::Button { .. } => {}
             wl_pointer::Event::Axis { .. } => {}
             _ => {}

@@ -1,21 +1,29 @@
-function draw_bg(canvas)
-    paint = Gfx:newPaint()
-    paint:setColor({
-        r = 0.8,
-        g = 0.6,
-        b = 0.1,
-        a = 1.0
+font_tf = Gfx:newTypeface("Courier New")
+font = Gfx:newFont(font_tf)
+
+function render(canvas, state)
+    local test_string = Gfx:newTextBlob(state["test_collector"], font)
+    
+    canvas:drawTextBlob(test_string, math.random(10, 50), math.random(10, 50), {
+        h = 20,
+        s = 0.5,
+        l = 0.6
     })
-    canvas:drawCircle({x = 200, y = 50.0}, 20, {
-        h = 1.0,
-        s = 0.8,
-        l = 0.5,
-        a = 1.0
-    })
-    canvas:drawCircle({12.0, 200}, 20, paint)
+end
+
+function test(status)
+    status:requestUpdate(200)
+
+    local handle = io.popen('date +"%T.%N"')
+    local result = handle:read("*a")
+    handle:close()
+    return result
 end
 
 settings = {
-    framerate = 30,
-    background = draw_bg,
+    draw = render,
+    collectors = {
+        ["username"] = "caellian",
+        ["test_collector"] = test,
+    }
 }

@@ -19,6 +19,8 @@ rlua = { path = "./vendored/rlua", default-features = false }
 bitflags = "2.4.1"
 rand = "0.8.5"
 phf = { version = "0.11", features = ["macros"] }
+any_vec = { version = "0.13" }
+mio = { verson = "0.8.9", features = ["os-poll"] }
 
 fork = "0.1.20"
 clap = { version = "4.4.8", features = ["derive"] }
