@@ -13,11 +13,12 @@ use env_logger::Env;
 use error::ClunkyError;
 use glam::{IVec2, UVec2};
 use render::{
-    frontend::{bindings::LuaCanvas, FBAsSurface},
+    frontend::{bindings::LuaCanvas, FrameBufferSurface},
     RenderTarget, RenderTargetImpl, TargetConfig,
 };
 use rlua::prelude::*;
 use script::{events::EventBuffer, settings::Settings};
+use skia_safe::{Color, Color4f};
 
 use crate::{render::buffer::FrameBuffer, script::ScriptContext};
 
@@ -99,7 +100,9 @@ fn draw_frame<Q, T: RenderTarget<Q>>(
         let result = script.lua().context(|lua| {
             let render_fn: LuaFunction = lua.registry_value(draw_cb)?;
 
-            let mut surface = target.buffer().as_surface();
+            let mut surface = target.buffer().to_surface();
+            let canvas = surface.canvas();
+            canvas.clear(Color4f::from(Color::TRANSPARENT));
             let canvas = unsafe {
                 // SAFETY: calling render_fn will block the current thread
                 // until Lua function is done executing. During that time,

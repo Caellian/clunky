@@ -180,8 +180,16 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
 
     fn push_frame(&mut self, qh: Self::QH) {
         let surface = require_some!(&self.wl_surface);
-        surface.frame(&qh, CallbackKind::Frame);
+        let fb = require_some!(&self.frame_buffer);
+
+        // re-attach buffer and mark it as damaged
+        surface.attach(Some(fb.buffer()), 0, 0);
+        surface.damage_buffer(0, 0, self.size.x as i32, self.size.y as i32);
         self.do_render = false;
+        surface.commit();
+
+        // request notification when to draw the next frame
+        surface.frame(&qh, CallbackKind::Frame);
         surface.commit();
     }
 
@@ -238,6 +246,7 @@ impl Dispatch<wl_callback::WlCallback, CallbackKind> for WaylandState {
         if let wl_callback::Event::Done { .. } = event {
             match kind {
                 CallbackKind::Frame => {
+                    // we're ready to draw the next frame
                     state.do_render = true;
                 }
             }
@@ -379,11 +388,14 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandState {
     ) {
         match event {
             wl_buffer::Event::Release => {
+                /* Not used as we listen for frame notifications
                 if let Some(fb) = &state.frame_buffer {
+
                     if fb.buffer().id() == buffer.id() {
-                        log::info!("Buffer released");
+                        log::debug!("Buffer released");
                     }
                 }
+                */
             }
             _ => {}
         }

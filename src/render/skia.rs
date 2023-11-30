@@ -2,12 +2,12 @@ use skia_safe::{surfaces, Borrows, ColorSpace, ColorType, ImageInfo, Surface};
 
 use super::buffer::FrameBuffer;
 
-pub trait FBAsSurface {
-    fn as_surface<'a>(&'a mut self) -> Borrows<'a, Surface>;
+pub trait FrameBufferSurface {
+    fn to_surface<'a>(&'a mut self) -> Borrows<'a, Surface>;
 }
 
-impl FBAsSurface for FrameBuffer {
-    fn as_surface<'a>(&'a mut self) -> Borrows<'a, Surface> {
+impl FrameBufferSurface for FrameBuffer {
+    fn to_surface<'a>(&'a mut self) -> Borrows<'a, Surface> {
         let size = self.frame_parameters().dimensions;
 
         let info =

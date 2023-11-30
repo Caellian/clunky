@@ -1,5 +1,6 @@
 use std::{
     alloc::Layout,
+    any::type_name,
     collections::{HashMap, VecDeque},
     ffi::CString,
     mem::{align_of, size_of},
@@ -20,6 +21,7 @@ use skia_safe::{
     path_effect::DashInfo,
     rrect::{Corner as RRectCorner, Type as RRectType},
     stroke_rec::{InitStyle as StrokeRecInitStyle, Style as StrokeRecStyle},
+    trim_path_effect::Mode as TrimMode,
     *,
 };
 
@@ -256,6 +258,11 @@ enum_naming! { RRectCorner: [
     RRectCorner::LowerLeft => "lower_left",
 ]}
 
+enum_naming! { TrimMode: [
+    TrimMode::Normal => "normal",
+    TrimMode::Inverted => "inverted",
+]}
+
 macro_rules! named_bitflags {
     ($kind: ty: [$($value: expr => $name: literal,)+]) => {paste::paste!{
         enum_naming! { $kind : [
@@ -319,6 +326,106 @@ named_bitflags! { SurfacePropsFlags: [
     SurfacePropsFlags::DYNAMIC_MSAA => "dynamic_msaa",
     SurfacePropsFlags::ALWAYS_DITHER => "always_dither",
 ]}
+
+enum NeverT {}
+impl<'lua> FromLua<'lua> for NeverT {
+    fn from_lua(lua_value: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
+        Err(LuaError::FromLuaConversionError {
+            from: lua_value.type_name(),
+            to: "!",
+            message: Some("no type can be converted into ! type".to_string()),
+        })
+    }
+}
+
+macro_rules! impl_one_of {
+    ($($ts: ident)*) => {
+        #[non_exhaustive]
+        #[allow(private_interfaces)]
+        pub enum OneOf<$($ts = NeverT),*> {
+            $($ts($ts)),*
+        }
+
+        impl<$($ts),*> OneOf<$($ts),*> {
+            fn expected_types() -> &'static str {
+                static STORE: OnceLock<&'static str> = OnceLock::new();
+
+                STORE.get_or_init(|| {
+                    let mut result = String::new();
+                    for entry in [$(type_name::<$ts>()),*] {
+                        if entry == type_name::<NeverT>() {
+                            continue
+                        }
+
+                        if !result.is_empty() {
+                            result.push(',');
+                        }
+
+                        result.extend(entry.chars());
+                    }
+                    result.leak()
+                })
+            }
+
+            fn target_t() -> &'static str {
+                static STORE: OnceLock<&'static str> = OnceLock::new();
+
+                STORE.get_or_init(|| {
+                    format!("OneOf<{}>", Self::expected_types()).leak()
+                })
+            }
+
+            fn type_name(&self) -> &'static str {
+                match self {
+                    $(
+                        Self::$ts(_) => type_name::<$ts>(),
+                    )*
+                }
+            }
+
+            paste::paste!{$(
+                pub fn [<is_ $ts:lower>](&self) -> bool {
+                    match self {
+                        Self::$ts(_) => true,
+                        _ => false,
+                    }
+                }
+                pub fn [<as_ $ts:lower>](&self) -> Option<&$ts> {
+                    match self {
+                        Self::$ts(it) => Some(it),
+                        _ => None,
+                    }
+                }
+                pub fn [<unwrap_ $ts:lower>](self) -> $ts {
+                    match self {
+                        Self::$ts(it) => it,
+                        other => panic!(concat!["expected ", stringify!($ts), "; found {:?} variant instead"], other.type_name()),
+                    }
+                }
+            )*}
+        }
+
+        impl<'lua, $($ts),*> FromLua<'lua> for OneOf<$($ts),*> where $($ts: FromLua<'lua>),* {
+            fn from_lua(value: LuaValue<'lua>, lua: LuaContext<'lua>) -> LuaResult<Self> {
+                $(
+                    if type_name::<$ts>() != type_name::<NeverT>() { // optimize NeverT checks away
+                        if let Ok(it) = $ts::from_lua(value.clone(), lua) {
+                            return Ok(Self::$ts(it));
+                        }
+                    }
+                )*
+
+                Err(LuaError::FromLuaConversionError {
+                    from: value.type_name(),
+                    to: Self::target_t(),
+                    message: Some(format!("unable to convert into any of expected types: {}", Self::expected_types()))
+                })
+            }
+        }
+    };
+}
+
+impl_one_of!(A B C D E F G H I J K L M N O P);
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct LuaColor {
@@ -1315,14 +1422,9 @@ macro_rules! wrap_skia_handle {
     };
 }
 
-macro_rules! type_like_table {
-    ($handle: ty: |$ident: ident: LuaTable, $ctx: ident: LuaContext| $body: block) => {
+macro_rules! type_like {
+    ($handle: ty) => {
         paste::paste! {
-            impl<'lua> TryFrom<(LuaTable<'lua>, LuaContext<'lua>)> for [<Lua $handle>] {
-                type Error = LuaError;
-
-                fn try_from(($ident, $ctx): (LuaTable<'lua>, LuaContext<'lua>)) -> Result<Self, Self::Error> $body
-            }
             #[derive(Clone)]
             pub struct [<Like $handle>]([<Lua $handle>]);
 
@@ -1353,6 +1455,19 @@ macro_rules! type_like_table {
                 fn as_ref(&self) -> &$handle {
                     &self.0
                 }
+            }
+        }
+    };
+}
+
+macro_rules! type_like_table {
+    ($handle: ty: |$ident: ident: LuaTable, $ctx: ident: LuaContext| $body: block) => {
+        type_like!($handle);
+        paste::paste! {
+            impl<'lua> TryFrom<(LuaTable<'lua>, LuaContext<'lua>)> for [<Lua $handle>] {
+                type Error = LuaError;
+
+                fn try_from(($ident, $ctx): (LuaTable<'lua>, LuaContext<'lua>)) -> Result<Self, Self::Error> $body
             }
             impl<'lua> FromLua<'lua> for [<Like $handle>] {
                 fn from_lua(lua_value: LuaValue<'lua>, ctx: LuaContext<'lua>) -> LuaResult<Self> {
@@ -1583,6 +1698,61 @@ impl UserData for LuaMaskFilter {
 }
 
 wrap_skia_handle!(DashInfo);
+type_like!(DashInfo);
+
+impl<'lua> TryFrom<LuaTable<'lua>> for LuaDashInfo {
+    type Error = LuaError;
+    fn try_from(t: LuaTable<'lua>) -> Result<Self, Self::Error> {
+        let phase: f32 = t.get("intervals").unwrap_or_default();
+        if let Ok(intervals) = t.get("intervals") {
+            return Ok(LuaDashInfo(DashInfo { intervals, phase }));
+        } else {
+            let intervals: Vec<f32> = t
+                .sequence_values::<f32>()
+                .take_while(|it| it.is_ok())
+                .map(|it| it.unwrap())
+                .collect();
+
+            if intervals.len() > 0 {
+                return Ok(LuaDashInfo(DashInfo { intervals, phase }));
+            }
+        }
+        return Err(LuaError::FromLuaConversionError {
+            from: "table",
+            to: "DashInfo",
+            message: Some("not a valid DashInfo".to_string()),
+        });
+    }
+}
+
+impl<'lua> FromLuaMulti<'lua> for LikeDashInfo {
+    fn from_lua_multi(
+        values: LuaMultiValue<'lua>,
+        ctx: LuaContext<'lua>,
+        consumed: &mut usize,
+    ) -> LuaResult<Self> {
+        if let Ok((intervals, phase)) = FromLuaMulti::from_lua_multi(values.clone(), ctx, consumed)
+        {
+            return Ok(LikeDashInfo(LuaDashInfo(DashInfo { intervals, phase })));
+        }
+
+        let value = values.into_iter().next().unwrap_or(LuaNil);
+        let table = match value {
+            LuaValue::UserData(ud) if ud.is::<LuaDashInfo>() => {
+                return Ok(LikeDashInfo(ud.borrow::<LuaDashInfo>()?.to_owned()));
+            }
+            LuaValue::Table(it) => it,
+            other => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "DashInfo",
+                    message: Some("expected DashInfo or constructor Table".to_string()),
+                });
+            }
+        };
+        LuaDashInfo::try_from(table).map(LikeDashInfo)
+    }
+}
 
 impl UserData for LuaDashInfo {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
@@ -1700,6 +1870,58 @@ impl UserData for LuaPathEffect {
             },
         );
         methods.add_method("needsCTM", |_, this, ()| Ok(this.needs_ctm()));
+    }
+}
+
+pub struct PathEffectCtors;
+
+impl UserData for PathEffectCtors {
+    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+        methods.add_method(
+            "MakeSum",
+            |_, _, (first, second): (LuaPathEffect, LuaPathEffect)| {
+                Ok(LuaPathEffect(path_effect::PathEffect::sum(
+                    first.0, second.0,
+                )))
+            },
+        );
+        methods.add_method(
+            "MakeCompose",
+            |_, _, (outer, inner): (LuaPathEffect, LuaPathEffect)| {
+                Ok(LuaPathEffect(path_effect::PathEffect::compose(
+                    outer.0, inner.0,
+                )))
+            },
+        );
+        methods.add_method("MakeDash", |_, _, like_dash: LikeDashInfo| {
+            Ok(
+                skia_safe::dash_path_effect::new(&like_dash.intervals, like_dash.phase)
+                    .map(LuaPathEffect),
+            )
+        });
+        methods.add_method(
+            "MakeTrim",
+            |_, _, (start, stop, mode): (f32, f32, Option<String>)| {
+                let mode = match mode {
+                    Some(it) => Some(read_trim_mode(&it)?),
+                    None => None,
+                };
+                Ok(skia_safe::trim_path_effect::new(start, stop, mode).map(LuaPathEffect))
+            },
+        );
+        methods.add_method("MakeRadius", |_, _, radius: f32| {
+            Ok(skia_safe::corner_path_effect::new(radius).map(LuaPathEffect))
+        });
+        methods.add_method(
+            "MakeDiscrete",
+            |_, _, (length, dev, seed): (f32, f32, Option<u32>)| {
+                Ok(skia_safe::discrete_path_effect::new(length, dev, seed).map(LuaPathEffect))
+            },
+        );
+        methods.add_method("Make2DPath", |_, _, (width, mx): (f32, LuaMatrix)| {
+            let mx: Matrix = mx.into();
+            Ok(skia_safe::line_2d_path_effect::new(width, &mx).map(LuaPathEffect))
+        });
     }
 }
 
@@ -2042,6 +2264,7 @@ type_like_table!(Paint: |value: LuaTable, ctx: LuaContext| {
     }
 
     if let Some(style) = value.get::<_, LuaTable>("style").ok() {
+        // TODO: Should support basic string, as well as array of strings
         let fill: bool = style.get("fill").unwrap_or_default();
         let stroke: bool = style.get("stroke").unwrap_or_default();
         paint.set_style(match (fill, stroke) {
@@ -2694,11 +2917,15 @@ impl UserData for LuaSurfaceProps {
 }
 
 type_like_table!(SurfaceProps: |value: LuaTable| {
-    let flags = match value.get::<_, LuaTable>("flags") {
-        Ok(it) => read_surface_props_flags_table(it)?,
-        Err(LuaError::FromLuaConversionError { from: "nil", .. }) => {
+    let flags = match value.get::<_, OneOf<LuaTable, LuaValue>>("flags") {
+        Ok(OneOf::A(it)) => read_surface_props_flags_table(it)?,
+        Ok(OneOf::B(it)) if matches!(it, LuaNil) => {
             SurfacePropsFlags::empty()
         }
+        Ok(OneOf::B(other)) => {
+            return Err(LuaError::FromLuaConversionError { from: other.type_name(), to: "SurfacePropFlags", message: None })
+        }
+        Ok(_) => unreachable!(),
         Err(other) => return Err(other)
     };
     let pixel_geometry = read_pixel_geometry(value.get::<_, String>("pixel_geometry").unwrap_or("unknown".to_string()))?;
@@ -3436,6 +3663,8 @@ impl<'a> UserData for LuaCanvas<'a> {
                 Ok(())
             },
         );
+        methods.add_method("width", |_, this, ()| Ok(this.base_layer_size().width));
+        methods.add_method("height", |_, this, ()| Ok(this.base_layer_size().height));
     }
 }
 
@@ -3541,15 +3770,6 @@ impl UserData for LuaGfx {
                 other
             ))),
         });
-        methods.add_method(
-            "newDashInfo",
-            |_, _, (intervals, phase): (Vec<f32>, Option<f32>)| {
-                Ok(LuaDashInfo(DashInfo {
-                    intervals,
-                    phase: phase.unwrap_or_default(),
-                }))
-            },
-        );
         methods.add_method("newStrokeRec", |_, _, init_style: String| {
             Ok(LuaStrokeRec(StrokeRec::new(read_stroke_rec_init_style(
                 init_style,
@@ -3562,5 +3782,11 @@ impl UserData for LuaGfx {
 pub fn setup<'lua>(ctx: LuaContext<'lua>) -> Result<(), rlua::Error> {
     let gfx = ctx.create_userdata(LuaGfx)?;
     ctx.globals().set("Gfx", gfx)?;
+
+    {
+        let constructors = ctx.create_userdata(PathEffectCtors)?;
+        ctx.globals().set("PathEffect", constructors)?;
+    }
+
     Ok(())
 }
