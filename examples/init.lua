@@ -1,4 +1,4 @@
-font_tf = Gfx:newTypeface("Courier New")
+font_tf = Typeface:MakeFromName("Courier New")
 font = Gfx:newFont(font_tf)
 
 primary = {

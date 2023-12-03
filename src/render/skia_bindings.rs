@@ -4,7 +4,6 @@ use std::{
     collections::{HashMap, VecDeque},
     ffi::CString,
     mem::{align_of, size_of},
-    path::PathBuf,
     ptr::addr_of,
     sync::{Arc, OnceLock},
 };
@@ -1613,18 +1612,40 @@ impl UserData for LuaImage {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
         methods.add_method("width", |_, this, ()| Ok(this.width()));
         methods.add_method("height", |_, this, ()| Ok(this.height()));
-        // TODO: Cleanup
-        methods.add_method("newShader", |_, this, ()| {
-            this.to_shader(
-                Some((TileMode::Clamp, TileMode::Clamp)),
-                SamplingOptions::default(),
-                None,
-            )
-            .map(LuaShader)
-            .ok_or(LuaError::RuntimeError(
-                "can't create shader from image".to_string(),
-            ))
-        });
+        methods.add_method(
+            "newShader",
+            |_,
+             this,
+             (tile_x, tile_y, sampling, local_matrix): (
+                Option<String>,
+                Option<String>,
+                Option<LuaSamplingOptions>,
+                Option<LuaMatrix>,
+            )| {
+                let tile_modes = if tile_x.is_none() && tile_y.is_none() {
+                    None
+                } else {
+                    let n_tile_x = match tile_x.as_ref() {
+                        Some(it) => read_tile_mode(it)?,
+                        None => TileMode::Clamp,
+                    };
+                    let n_tile_y = match tile_y.as_ref() {
+                        Some(it) => read_tile_mode(it)?,
+                        None => n_tile_x,
+                    };
+                    Some((n_tile_x, n_tile_y))
+                };
+                let local_matrix = local_matrix.map(LuaMatrix::into);
+
+                Ok(this
+                    .to_shader(
+                        tile_modes,
+                        sampling.unwrap_or_default(),
+                        local_matrix.as_ref(),
+                    )
+                    .map(LuaShader))
+            },
+        );
     }
 }
 
@@ -1678,13 +1699,58 @@ decl_constructors!(ColorSpace: {
 wrap_skia_handle!(Picture);
 impl UserData for LuaPicture {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
-        /* TODO: https://api.skia.org/classSkPicture.html
-        playback
-        cullRect
-        approximateOpCount
-        approximateBytesUsed
-        makeShader
-        */
+        methods.add_method("playback", |_, this, canvas: LuaCanvas| {
+            this.playback(&canvas);
+            Ok(())
+        });
+        methods.add_method("cullRect", |_, this, ()| {
+            Ok(LuaRect::from(this.cull_rect()))
+        });
+        methods.add_method("approximateOpCount", |_, this, nested: Option<bool>| {
+            Ok(this.approximate_op_count_nested(nested.unwrap_or_default()))
+        });
+        methods.add_method("approximateBytesUsed", |_, this, ()| {
+            Ok(this.approximate_bytes_used())
+        });
+        methods.add_method(
+            "makeShader",
+            |_,
+             this,
+             (tile_x, tile_y, mode, local_matrix, tile_rect): (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<LuaMatrix>,
+                Option<LuaRect>,
+            )| {
+                let tm = if tile_x.is_none() && tile_y.is_none() {
+                    None
+                } else {
+                    let n_tile_x = match tile_x.as_ref() {
+                        Some(it) => read_tile_mode(it)?,
+                        None => TileMode::Clamp,
+                    };
+                    let n_tile_y = match tile_y.as_ref() {
+                        Some(it) => read_tile_mode(it)?,
+                        None => n_tile_x,
+                    };
+                    Some((n_tile_x, n_tile_y))
+                };
+                let mode = match mode {
+                    Some(it) => read_filter_mode(it)?,
+                    None => FilterMode::Nearest,
+                };
+                let local_matrix: Option<Matrix> = local_matrix.map(LuaMatrix::into);
+                let tile_rect: Option<Rect> = tile_rect.map(LuaRect::into);
+
+                Ok(LuaShader(this.to_shader(
+                    tm,
+                    mode,
+                    local_matrix.as_ref(),
+                    tile_rect.as_ref(),
+                )))
+            },
+        );
     }
 }
 
