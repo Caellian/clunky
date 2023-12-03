@@ -20,7 +20,7 @@ bitflags = "2.4.1"
 rand = "0.8.5"
 phf = { version = "0.11", features = ["macros"] }
 any_vec = { version = "0.13" }
-mio = { verson = "0.8.9", features = ["os-poll"] }
+#mio = { verson = "0.8.9", features = ["os-poll"] }
 
 fork = "0.1.20"
 clap = { version = "4.4.8", features = ["derive"] }
@@ -28,8 +28,8 @@ clap = { version = "4.4.8", features = ["derive"] }
 # Rendering
 image = "0.24.7"
 glam = "0.24.2"
-skia-safe = "0.68.0"
-skia-bindings = "0.68.0"
+skia-safe = { git = "https://github.com/rust-skia/rust-skia.git", rev = "03ef1ef138b5870c26b8c38d8c356d90cbecde39" }
+skia-bindings = { git = "https://github.com/rust-skia/rust-skia.git", rev = "03ef1ef138b5870c26b8c38d8c356d90cbecde39" }
 
 # Logging & errors
 log = "0.4.20"

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
-use rlua::*;
+use crate::{error::ClunkyError, render::frontend::bindings::LuaTypeface};
+use rlua::prelude::*;
 use settings::Settings;
 
 pub mod data;
@@ -14,7 +14,7 @@ pub struct ScriptContext {
 }
 
 impl ScriptContext {
-    pub fn new(path: impl AsRef<Path>) -> Result<ScriptContext> {
+    pub fn new(path: impl AsRef<Path>) -> Result<ScriptContext, ClunkyError> {
         let canonical_path = path
             .as_ref()
             .canonicalize()
@@ -24,7 +24,7 @@ impl ScriptContext {
 
         let lua = Lua::new();
 
-        lua.context::<_, Result<()>>(|lua_ctx| {
+        lua.context::<_, Result<(), ClunkyError>>(|lua_ctx| {
             let g = lua_ctx.globals();
 
             if let Some(file_name) = path.as_ref().to_str() {
@@ -86,11 +86,23 @@ impl Drop for ScriptContext {
     }
 }
 
-pub fn lua_is_eq<'lua, A: ToLua<'lua>, B: ToLua<'lua>>(ctx: &Context<'lua>, a: A, b: B) -> bool {
+pub fn lua_is_eq<'lua, A: ToLua<'lua>, B: ToLua<'lua>>(ctx: &LuaContext<'lua>, a: A, b: B) -> bool {
     // TODO: Remove when https://github.com/amethyst/rlua/issues/112 is resolved
-    let check: Function<'lua> = ctx
+    let check: LuaFunction<'lua> = ctx
         .load("function(a, b) return a == b end")
         .eval()
         .expect("invalid check expression");
     check.call((a, b)).unwrap_or_default()
+}
+
+#[inline]
+pub fn vec_to_table<'lua, T: ToLua<'lua>>(
+    ctx: LuaContext<'lua>,
+    vec: Vec<T>,
+) -> Result<LuaTable<'lua>, LuaError> {
+    ctx.create_table_from(
+        vec.into_iter()
+            .enumerate()
+            .map(|(i, it)| (i as LuaInteger, it)),
+    )
 }

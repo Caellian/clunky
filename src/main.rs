@@ -112,7 +112,7 @@ fn draw_frame<Q, T: RenderTarget<Q>>(
                 // that also the refence to `target`. Passing actual
                 // references isn't supported so canvas lifetime has
                 // to be erased for temporary LuaCanvas wrapper.
-                LuaCanvas(addr_of!(*surface.canvas()).as_ref().unwrap_unchecked())
+                LuaCanvas::Borrowed(addr_of!(*surface.canvas()).as_ref().unwrap_unchecked())
             };
 
             let state_value: LuaTable = lua
