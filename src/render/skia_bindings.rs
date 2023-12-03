@@ -1678,8 +1678,7 @@ decl_constructors!(ColorSpace: {
 wrap_skia_handle!(Picture);
 impl UserData for LuaPicture {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
-        // TODO: https://api.skia.org/classSkPicture.html
-        /*
+        /* TODO: https://api.skia.org/classSkPicture.html
         playback
         cullRect
         approximateOpCount
@@ -3844,7 +3843,6 @@ impl Into<SamplingOptions> for LuaSamplingOptions {
 wrap_skia_handle!(Surface);
 
 impl UserData for LuaSurface {
-    /* TODO: https://api.skia.org/classSkSurface.html */
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
         // capabilities - not useful from Lua?
         // characterize - no graphite bindings
@@ -4014,7 +4012,7 @@ impl UserData for LuaFontMgr {
         methods.add_method("getFamilyName", |_, this, index: usize| {
             Ok(this.unwrap().family_name(index))
         });
-        // TODO: legacyMakeTypeface - not in skia_safe
+        // NYI: legacyMakeTypeface by skia_safe
         methods.add_method(
             "makeFromData",
             |_, this, (bytes, ttc): (Vec<u8>, Option<usize>)| {
@@ -4081,7 +4079,6 @@ decl_constructors!(FontMgr: {
 wrap_skia_handle!(Typeface);
 
 impl UserData for LuaTypeface {
-    /* TODO: https://api.skia.org/classSkTypeface.html */
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
         methods.add_method("countGlyphs", |_, this, ()| Ok(this.count_glyphs()));
         methods.add_method("countTables", |_, this, ()| Ok(this.count_tables()));
@@ -4093,8 +4090,8 @@ impl UserData for LuaTypeface {
                 .collect();
             Ok(names)
         });
-        // TODO: createScalerContext not yet implemented by skia_safe
-        // - filterRec
+        // NYI: createScalerContext by skia_safe
+        // NYI: filterRec by skia_safe
         methods.add_method("fontStyle", |_, this, ()| {
             Ok(LuaFontStyle(this.font_style()))
         });
@@ -4133,8 +4130,8 @@ impl UserData for LuaTypeface {
         methods.add_method("isFixedPitch", |_, this, ()| Ok(this.is_fixed_pitch()));
         methods.add_method("isItalic", |_, this, ()| Ok(this.is_italic()));
         methods.add_method("makeClone", |_, this, ()| Ok(LuaTypeface(this.0.clone())));
-        // TODO: openExistingStream NYI by skia_safe
-        // TODO: openStream NYI by skia_safe
+        // NYI: openExistingStream by skia_safe
+        // NYI: openStream by skia_safe
         methods.add_method(
             "textToGlyphs",
             |_, this, (text, encoding): (Vec<LuaInteger>, Option<String>)| {
@@ -4187,6 +4184,7 @@ impl UserData for LuaTypeface {
 }
 
 // TODO: Typeface::make_empty NYI by skia_safe
+
 decl_constructors!(Typeface: {
     fn make_default() -> _ {
         Ok(LuaTypeface(Typeface::default()))
@@ -4847,7 +4845,15 @@ impl<'a> UserData for LuaCanvas<'a> {
                 Ok(())
             },
         );
-        //TODO: methods.add_method("drawPicture", |_, this, ()| Ok(()));
+        methods.add_method(
+            "drawPicture",
+            |_, this, (picture, matrix, paint): (LuaPicture, Option<LuaMatrix>, Option<LikePaint>)| {
+                let matrix: Option<Matrix> = matrix.map(LuaMatrix::into);
+                let paint: Option<Paint> = paint.map(LikePaint::unwrap);
+                this.draw_picture(picture, matrix.as_ref(), paint.as_ref());
+                Ok(())
+            },
+        );
         methods.add_method(
             "drawTextBlob",
             |_, this, (blob, point, paint): (LuaTextBlob, LuaPoint, LikePaint)| {
