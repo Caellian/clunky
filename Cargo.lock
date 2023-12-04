@@ -229,6 +229,7 @@ version = "0.1.0"
 dependencies = [
  "any_vec",
  "bitflags 2.4.1",
+ "byteorder",
  "clap",
  "drain_filter_polyfill",
  "env_logger",

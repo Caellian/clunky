@@ -33,7 +33,14 @@ fn main() {
 
     let args = Arguments::parse();
 
-    let script = ScriptContext::new(args.script).expect("unable to load lua context");
+    let script = match ScriptContext::new(args.script) {
+        Ok(it) => it,
+        Err(err) => {
+            print_stack_trace(&err);
+            exit(1);
+        }
+    };
+
     let (settings, mut collectors) = {
         let mut s = script.load_settings();
         let collectors = s.data_collectors.take().unwrap_or_default();
@@ -128,13 +135,19 @@ fn draw_frame<Q, T: RenderTarget<Q>>(
         });
 
         if let Err(err) = result {
-            log::error!("{}", err);
-            if let Some(source) = err.source() {
-                log::error!("{}", source);
-            }
+            print_stack_trace(&err);
             exit(1);
         }
 
         target.push_frame(qh);
+    }
+}
+
+fn print_stack_trace(error: &dyn Error) {
+    log::error!("{}", error);
+    let mut current = error.source();
+    while let Some(err) = current {
+        log::error!("{}", err);
+        current = err.source();
     }
 }

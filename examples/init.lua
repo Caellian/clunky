@@ -1,5 +1,5 @@
 font_tf = Typeface:MakeFromName("Courier New")
-font = Gfx:newFont(font_tf)
+font = Font(font_tf)
 
 primary = {
     h = 120,
@@ -20,7 +20,7 @@ function cpu_arc(canvas, position, radius, cpu_info)
         local startAngle = (i - 0.5) * angleIncrement
         local endAngle = (i + 0.5) * angleIncrement - angleIncrement / 2
 
-        local path = Gfx:newPath()
+        local path = Path()
         path:addArc({
             left = position[1] - radius,
             top = position[2] - radius,

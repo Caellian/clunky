@@ -2,13 +2,15 @@ use std::{
     alloc::Layout,
     any::type_name,
     collections::{HashMap, VecDeque},
-    ffi::CString,
+    ffi::OsString,
     mem::{align_of, size_of},
+    os::unix::ffi::{OsStrExt, OsStringExt},
     ptr::addr_of,
     str::FromStr,
     sync::{Arc, OnceLock},
 };
 
+use byteorder::WriteBytesExt;
 use phf::phf_map;
 use rlua::{prelude::*, Context as LuaContext, Table as LuaTable, UserData};
 use skia_safe::{
@@ -117,6 +119,7 @@ macro_rules! named_enum {
                 self.map(|t| t.0)
             }
 
+            #[inline]
             fn unwrap_or_t(self, value: $kind) -> $kind {
                 match self {
                     Some(it) => it.0,
@@ -124,6 +127,7 @@ macro_rules! named_enum {
                 }
             }
 
+            #[inline]
             fn unwrap_or_else_t(self, value_fn: impl Fn() -> $kind) -> $kind {
                 match self {
                     Some(it) => it.0,
@@ -1615,6 +1619,11 @@ macro_rules! wrap_skia_handle {
                     &mut self.0
                 }
             }
+            impl Into<$handle> for [<Lua $handle>] {
+                fn into(self) -> $handle {
+                    self.0
+                }
+            }
             impl AsRef<$handle> for [<Lua $handle>] {
                 fn as_ref(&self) -> &$handle {
                     &self.0
@@ -1624,6 +1633,28 @@ macro_rules! wrap_skia_handle {
             impl [<Lua $handle>] {
                 pub fn unwrap(self) -> $handle {
                     self.0
+                }
+            }
+            impl FromLuaOption<$handle> for Option<[<Lua $handle>]> {
+                #[inline]
+                fn map_t(self) -> Option<$handle> {
+                    self.map(|t| t.0)
+                }
+
+                #[inline]
+                fn unwrap_or_t(self, value: $handle) -> $handle {
+                    match self {
+                        Some(it) => it.0,
+                        None => value
+                    }
+                }
+
+                #[inline]
+                fn unwrap_or_else_t(self, value_fn: impl Fn() -> $handle) -> $handle {
+                    match self {
+                        Some(it) => it.0,
+                        None => value_fn(),
+                    }
                 }
             }
         }
@@ -1662,6 +1693,28 @@ macro_rules! type_like {
             impl AsRef<$handle> for [<Like $handle>] {
                 fn as_ref(&self) -> &$handle {
                     &self.0
+                }
+            }
+            impl FromLuaOption<$handle> for Option<[<Like $handle>]> {
+                #[inline]
+                fn map_t(self) -> Option<$handle> {
+                    self.map(|t| t.0.0)
+                }
+
+                #[inline]
+                fn unwrap_or_t(self, value: $handle) -> $handle {
+                    match self {
+                        Some(it) => it.0.0,
+                        None => value
+                    }
+                }
+
+                #[inline]
+                fn unwrap_or_else_t(self, value_fn: impl Fn() -> $handle) -> $handle {
+                    match self {
+                        Some(it) => it.0.0,
+                        None => value_fn(),
+                    }
                 }
             }
         }
@@ -2577,7 +2630,7 @@ impl UserData for LuaStrokeRec {
 }
 
 macro_rules! decl_func_constructor {
-    ($handle: ident: |$ctx: ident| $imp: block) => {
+    ($handle: ident: |$ctx: tt| $imp: block) => {
         paste::paste! {
             fn [<register_ $handle:snake _constructor>]<'lua>(lua: LuaContext<'lua>) -> Result<(), LuaError> {
                 let globals = lua.globals();
@@ -2589,17 +2642,15 @@ macro_rules! decl_func_constructor {
             }
         }
     };
-    ($handle: ident: |$ctx: ident, $($name: ident: $value: ty),*| $imp: block) => {
+    ($handle: ident: |$ctx: ident, $($name: ident: $value: ident $( < $($gen: tt),* > )?),*| $imp: block) => {
         paste::paste! {
             fn [<register_ $handle:snake _constructor>]<'lua>(lua: LuaContext<'lua>) -> Result<(), LuaError> {
                 let globals = lua.globals();
                 let constructor = lua.create_function(|$ctx: LuaContext, args: LuaMultiValue| {
                     let mut args = args.into_iter();
                     $(
-                        let $name: LuaValue = args.next().ok_or_else(|| LuaError::RuntimeError(
-                            format!("missing '{}' argument in {} constructor; expected a value convertible to {}", stringify!($name), stringify!($handle), stringify!($value))
-                        ))?;
-                        let $name: $value = $value::from_lua($name, $ctx).map_err(|inner| LuaError::CallbackError{
+                        let $name: LuaValue = args.next().unwrap_or(LuaNil);
+                        let $name: $value$(<$($gen),*>)? = FromLuaMulti::from_lua_multi(LuaMultiValue::from_vec(vec![$name]), $ctx, &mut 0).map_err(|inner| LuaError::CallbackError {
                             traceback: format!("while converting '{}' argument value", stringify!($name)),
                             cause: std::sync::Arc::new(inner),
                         })?;
@@ -2611,7 +2662,7 @@ macro_rules! decl_func_constructor {
             }
         }
     };
-    ($handle: ident: |$ctx: ident, $multi: ident| $imp: block) => {
+    ($handle: ident: |$ctx: tt, $multi: tt| $imp: block) => {
         paste::paste! {
             fn [<register_ $handle:snake _constructor>]<'lua>(lua: LuaContext<'lua>) -> Result<(), LuaError> {
                 let globals = lua.globals();
@@ -3338,6 +3389,25 @@ impl UserData for LuaPaint {
     }
 }
 
+decl_func_constructor!(Paint: |ctx, color: Option<LuaColor>, color_space: Option<LuaColorSpace>| {
+    let paint = match (color, color_space) {
+        (None, None) => Paint::default(),
+        (Some(color), None) => {
+            let color: Color4f = color.into();
+            Paint::new(color, None)
+        }
+        (Some(color), Some(color_space)) => {
+            let color: Color4f = color.into();
+            Paint::new(color, Some(&*color_space))
+        }
+        (None, Some(color_space)) => {
+            let color: Color4f = Color::BLACK.into();
+            Paint::new(color, Some(&*color_space))
+        }
+    };
+    Ok(LuaPaint(paint))
+});
+
 wrap_skia_handle!(Path);
 
 impl UserData for LuaPath {
@@ -3633,6 +3703,17 @@ impl UserData for LuaPath {
     }
 }
 
+decl_constructors!(Path: {
+    fn make(points: Vec<LuaPoint>, verbs: Vec<LuaVerb>, conic_weights: Vec<f32>, fill_type: LuaPathFillType, volatile: Option<bool>) -> _ {
+        let points: Vec<Point> = points.into_iter().map(LuaPoint::into).collect();
+        let verbs: Vec<u8> = verbs.into_iter().map(|it| it.0 as u8).collect();
+        Ok(LuaPath(Path::new_from(&points, &verbs, &conic_weights, *fill_type, volatile)))
+    }
+});
+decl_func_constructor!(Path: |_| {
+    Ok(LuaPath(Path::default()))
+});
+
 wrap_skia_handle!(RRect);
 
 impl UserData for LuaRRect {
@@ -3734,6 +3815,15 @@ impl UserData for LuaRRect {
         methods.add_method("width", |_, this, ()| Ok(this.width()));
     }
 }
+
+decl_constructors!(RRect: {
+    fn make() -> _ {
+        Ok(LuaRRect(RRect::new()))
+    }
+});
+decl_func_constructor!(RRect: |_| {
+    Ok(LuaRRect(RRect::new()))
+});
 
 wrap_skia_handle!(ColorInfo);
 impl UserData for LuaColorInfo {
@@ -4126,6 +4216,25 @@ impl UserData for LuaSurface {
 // SAFETY: Clunky handles Lua and rendering on the same thread
 unsafe impl Send for LuaSurface {}
 
+decl_constructors!(Surfaces: {
+    fn null(size: LuaSize) -> _ {
+        let size: ISize = size.into();
+        Ok(surfaces::null(size).map(LuaSurface))
+    }
+    fn raster(info: LikeImageInfo, row_bytes: Option<usize>, props: Option<LikeSurfaceProps>) -> _ {
+        let info: ImageInfo = info.unwrap();
+        let row_bytes = row_bytes.unwrap_or_else(|| info.min_row_bytes());
+        let props: Option<SurfaceProps> = props.map_t();
+
+        Ok(surfaces::raster(
+            &info,
+            row_bytes,
+            props.as_ref(),
+        ).map(LuaSurface))
+    }
+    // wrap_pixels - not able to detect table value updates
+});
+
 wrap_skia_handle!(FontStyleSet);
 
 impl UserData for LuaFontStyleSet {
@@ -4155,6 +4264,99 @@ decl_constructors!(FontStyleSet: {
 
 // SAFETY: Clunky handles Lua and rendering on the same thread
 unsafe impl Send for LuaFontStyleSet {}
+
+pub struct LuaText {
+    pub text: OsString,
+    pub encoding: TextEncoding,
+}
+
+fn encoding_size(encoding: TextEncoding) -> usize {
+    match encoding {
+        TextEncoding::UTF8 => 1,
+        TextEncoding::UTF16 => 2,
+        TextEncoding::UTF32 => 4,
+        TextEncoding::GlyphId => size_of::<GlyphId>(),
+    }
+}
+
+impl<'lua> FromLuaMulti<'lua> for LuaText {
+    fn from_lua_multi(
+        values: LuaMultiValue<'lua>,
+        _: LuaContext<'lua>,
+        consumed: &mut usize,
+    ) -> LuaResult<Self> {
+        let mut values = values.into_iter();
+
+        let bytes = match values.next() {
+            Some(LuaValue::String(text)) => {
+                let text = OsString::from_str(text.to_str()?).unwrap();
+                *consumed += 1;
+                return Ok(LuaText {
+                    text,
+                    encoding: TextEncoding::UTF8,
+                });
+            }
+            Some(LuaValue::Table(table)) => table,
+            Some(other) => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "Text",
+                    message: None,
+                });
+            }
+            None => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "nil",
+                    to: "Text",
+                    message: None,
+                });
+            }
+        };
+        *consumed += 1;
+
+        let bytes: Vec<LuaInteger> = bytes
+            .sequence_values::<LuaInteger>()
+            .take_while(Result::is_ok)
+            .filter_map(Result::ok)
+            .collect();
+
+        let encoding = match values.next() {
+            Some(LuaValue::String(encoding)) => {
+                if let Ok(it) = LuaTextEncoding::try_from(encoding) {
+                    *consumed += 1;
+                    *it
+                } else {
+                    TextEncoding::UTF8
+                }
+            }
+            _ => TextEncoding::UTF8,
+        };
+
+        let text = if matches!(encoding, TextEncoding::UTF8) {
+            bytes.into_iter().map(|it| it as u8).collect()
+        } else {
+            let size = encoding_size(encoding);
+            let mut result = Vec::with_capacity(bytes.len() * size);
+
+            match size {
+                2 => bytes.into_iter().map(|it| (it as u16)).for_each(|it| {
+                    let _ = result.write_u16::<byteorder::NativeEndian>(it);
+                }),
+                4 => bytes.into_iter().map(|it| (it as u32)).for_each(|it| {
+                    let _ = result.write_u32::<byteorder::NativeEndian>(it);
+                }),
+                _ => unreachable!("unhandled encoding size"),
+            }
+
+            result
+        };
+
+        Ok(LuaText {
+            text: OsString::from_vec(text),
+            encoding,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum LuaFontMgr {
@@ -4301,37 +4503,11 @@ impl UserData for LuaTypeface {
         methods.add_method("makeClone", |_, this, ()| Ok(LuaTypeface(this.0.clone())));
         // NYI: openExistingStream by skia_safe
         // NYI: openStream by skia_safe
-        methods.add_method(
-            "textToGlyphs",
-            |_, this, (text, encoding): (Vec<LuaInteger>, Option<LuaTextEncoding>)| match encoding
-                .unwrap_or_default_t()
-            {
-                TextEncoding::UTF8 => {
-                    let mut result = Vec::with_capacity(text.len());
-                    let cast: Vec<_> = text.into_iter().map(|it| it as u8).collect();
-                    this.text_to_glyphs(&cast, TextEncoding::UTF8, result.as_mut_slice());
-                    Ok(result)
-                }
-                TextEncoding::UTF16 => {
-                    let mut result = Vec::with_capacity(text.len());
-                    let cast: Vec<_> = text.into_iter().map(|it| it as u16).collect();
-                    this.text_to_glyphs(&cast, TextEncoding::UTF16, result.as_mut_slice());
-                    Ok(result)
-                }
-                TextEncoding::UTF32 => {
-                    let mut result = Vec::with_capacity(text.len());
-                    let cast: Vec<_> = text.into_iter().map(|it| it as u32).collect();
-                    this.text_to_glyphs(&cast, TextEncoding::UTF32, result.as_mut_slice());
-                    Ok(result)
-                }
-                TextEncoding::GlyphId => {
-                    let mut result = Vec::with_capacity(text.len());
-                    let cast: Vec<_> = text.into_iter().map(|it| it as GlyphId).collect();
-                    this.text_to_glyphs(&cast, TextEncoding::GlyphId, result.as_mut_slice());
-                    Ok(result)
-                }
-            },
-        );
+        methods.add_method("textToGlyphs", |_, this, text: LuaText| {
+            let mut result = Vec::with_capacity(text.text.len());
+            this.text_to_glyphs(text.text.as_bytes(), text.encoding, result.as_mut_slice());
+            Ok(result)
+        });
         methods.add_method("stringToGlyphs", |_, this, text: String| {
             let mut result = Vec::with_capacity(text.len());
             this.str_to_glyphs(&text, result.as_mut_slice());
@@ -4521,16 +4697,20 @@ impl UserData for LuaFontStyle {
     }
 }
 
+decl_func_constructor!(FontStyle: |ctx, weight: Option<FromLuaFontWeight>, width: Option<FromLuaFontWidth>, slant: Option<LuaSlant>| {
+    let weight = weight.map(|it| it.to_skia_weight()).unwrap_or(Weight::NORMAL);
+    let width = width.map(|it| it.to_skia_width()).unwrap_or(Width::NORMAL);
+    let slant = slant.unwrap_or_t(Slant::Upright);
+    Ok(LuaFontStyle(FontStyle::new(weight, width, slant)))
+});
+
 wrap_skia_handle!(Font);
 
 impl UserData for LuaFont {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
-        methods.add_method(
-            "countText",
-            |_, this, (text, encoding): (CString, Option<LuaTextEncoding>)| {
-                Ok(this.count_text(text.as_bytes(), encoding.unwrap_or_default_t()))
-            },
-        );
+        methods.add_method("countText", |_, this, text: LuaText| {
+            Ok(this.count_text(text.text.as_bytes(), text.encoding))
+        });
         methods.add_method(
             "getBounds",
             |_, this, (glyphs, paint): (Vec<GlyphId>, Option<LuaPaint>)| {
@@ -4640,11 +4820,11 @@ impl UserData for LuaFont {
         });
         methods.add_method(
             "measureText",
-            |_, this, (text, encoding, paint): (CString, Option<LuaTextEncoding>, Option<LuaPaint>)| {
+            |_, this, (text, paint): (LuaText, Option<LuaPaint>)| {
                 Ok(this
                     .measure_text(
-                        text.to_bytes(),
-                        encoding.unwrap_or_default_t(),
+                        text.text.as_bytes(),
+                        text.encoding,
                         paint.map(LuaPaint::unwrap).as_ref(),
                     )
                     .0)
@@ -4701,16 +4881,10 @@ impl UserData for LuaFont {
             this.set_typeface(typeface.unwrap());
             Ok(())
         });
-        methods.add_method(
-            "textToGlyphs",
-            |_, this, (text, encoding): (Vec<u8>, Option<LuaTextEncoding>)| {
-                // TODO: Allow non-u8 (u16, u32 & GlyphId) values
-                this.text_to_glyphs_vec(&text, encoding.unwrap_or_default_t());
-                Ok(())
-            },
-        );
-        methods.add_method("stringToGlyphs", |_, this, text: String| {
-            Ok(this.str_to_glyphs_vec(&text))
+        methods.add_method("textToGlyphs", |_, this, text: LuaText| {
+            // TODO: Allow non-u8 (u16, u32 & GlyphId) values
+            this.text_to_glyphs_vec(text.text.as_bytes(), text.encoding);
+            Ok(())
         });
         methods.add_method("unicharsToGlyphs", |_, this, unichars: Vec<Unichar>| {
             let mut result = Vec::with_capacity(unichars.len());
@@ -4722,6 +4896,13 @@ impl UserData for LuaFont {
         });
     }
 }
+
+decl_func_constructor!(Font: |ctx, typeface: LuaTypeface, size: Option<f32>, scale_x: Option<f32>, skew_x: Option<f32>| {
+    let size = size.unwrap_or(12.0);
+    let scale_x = scale_x.unwrap_or(1.0);
+    let skew_x = skew_x.unwrap_or(0.0);
+    Ok(LuaFont(Font::from_typeface_with_params(typeface, size, scale_x, skew_x)))
+});
 
 wrap_skia_handle!(TextBlob);
 
@@ -4737,6 +4918,23 @@ impl UserData for LuaTextBlob {
         );
     }
 }
+
+decl_constructors!(TextBlob: {
+    fn make_from_pos_text(text: LuaText, pos: Vec<LuaPoint>, font: LuaFont) -> _ {
+        let pos: Vec<Point> = pos.into_iter().map(LuaPoint::into).collect();
+        Ok(TextBlob::from_pos_text(text.text.as_bytes(), &pos, &font, text.encoding).map(LuaTextBlob))
+    }
+    fn make_from_pos_text_h(text: LuaText, x_pos: Vec<f32>, const_y: f32, font: LuaFont) -> _ {
+        Ok(TextBlob::from_pos_text_h(text.text.as_bytes(), &x_pos, const_y, &font, text.encoding).map(LuaTextBlob))
+    }
+    // TODO: make_from_RSXform()
+    fn make_from_string(string: String, font: LuaFont) -> _ {
+        Ok(TextBlob::new(string, &font).map(LuaTextBlob))
+    }
+    fn make_from_text(text: LuaText, font: LuaFont) -> _ {
+        Ok(TextBlob::from_text(text.text.as_bytes(), text.encoding, &font).map(LuaTextBlob))
+    }
+});
 
 #[derive(Clone)]
 pub struct LuaSaveLayerRec {
@@ -5075,50 +5273,6 @@ impl<'a> UserData for LuaCanvas<'a> {
     }
 }
 
-struct LuaGfx;
-impl UserData for LuaGfx {
-    fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
-        // TODO: Add other ColorFilter constructors
-        // TODO: Add other MaskFilter constructors
-        //TODO: methods.add_method("newLinearGradient", |ctx, this, ()| Ok(()));
-        methods.add_method("newPaint", |_, _, ()| Ok(LuaPaint(Paint::default())));
-        methods.add_method("newPath", |_, _, ()| Ok(LuaPath(Path::new())));
-        //TODO: methods.add_method("newPictureRecorder", |ctx, this, ()| Ok(()));
-        methods.add_method("newRRect", |_, _, ()| Ok(LuaRRect(RRect::new())));
-        methods.add_method("newRasterSurface", |_, _, (info, row_bytes, props): (LikeImageInfo, Option<usize>, Option<LikeSurfaceProps>)| {
-            Ok(surfaces::raster(
-                &info,
-                row_bytes,
-                props.map(|it| *it).as_ref(),
-            ).map(LuaSurface))
-        });
-        methods.add_method("newRasterSurfaceN32Premul", |_, _, size: LuaSize| {
-            Ok(surfaces::raster_n32_premul(size).map(LuaSurface))
-        });
-        methods.add_method("newTextBlob", |_, _, (text, font): (String, LuaFont)| {
-            Ok(TextBlob::new(text, &font).map(LuaTextBlob))
-        });
-        methods.add_method(
-            "newFontStyle",
-            |_,
-             _,
-             (weight, width, slant): (
-                FromLuaFontWeight,
-                FromLuaFontWidth,
-                Option<LuaSlant>,
-            )| {
-                Ok(LuaFontStyle(FontStyle::new(weight.to_skia_weight(), width.to_skia_width(), slant.unwrap_or_t(Slant::Upright))))
-            },
-        );
-        methods.add_method(
-            "newFont",
-            |_, _, (typeface, size): (LuaTypeface, Option<f32>)| {
-                Ok(LuaFont(Font::new(typeface.unwrap(), size)))
-            },
-        );
-    }
-}
-
 macro_rules! global_constructors {
     ($ctx: ident: $($t: ty),*) => {paste::paste!{
         $({
@@ -5136,16 +5290,18 @@ macro_rules! global_constructor_fns {
     }};
 }
 
+// TODO: Add other ColorFilter constructors
+// TODO: Add other MaskFilter constructors
+// TODO: methods.add_method("newLinearGradient", |ctx, this, ()| Ok(()));
+// TODO: methods.add_method("newPictureRecorder", |ctx, this, ()| Ok(()));
 #[allow(non_snake_case)]
 pub fn setup<'lua>(ctx: LuaContext<'lua>) -> Result<(), rlua::Error> {
-    let gfx = ctx.create_userdata(LuaGfx)?;
-    ctx.globals().set("Gfx", gfx)?;
-
     global_constructors!(ctx:
-        ColorSpace, FontMgr, FontStyleSet, Image, ImageFilters, Matrix, PathEffect, Typeface
+        ColorSpace, FontMgr, FontStyleSet, Image, ImageFilters, Matrix, Path,
+        PathEffect, RRect, Surfaces, TextBlob, Typeface
     );
     global_constructor_fns!(ctx:
-        StrokeRec
+        Font, FontStyle, Paint, Path, RRect, StrokeRec
     );
 
     Ok(())
