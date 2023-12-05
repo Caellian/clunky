@@ -163,4 +163,110 @@ pub mod rlua {
             }
         }
     }
+
+    pub mod combinators {
+        use super::*;
+        use std::any::type_name;
+        use std::sync::OnceLock;
+
+        pub enum NeverT {}
+        impl<'lua> FromLua<'lua> for NeverT {
+            fn from_lua(lua_value: Value<'lua>, _: Context<'lua>) -> Result<Self, Error> {
+                Err(Error::FromLuaConversionError {
+                    from: lua_value.type_name(),
+                    to: "!",
+                    message: Some("no type can be converted into ! type".to_string()),
+                })
+            }
+        }
+
+        macro_rules! impl_one_of {
+            ($($ts: ident)*) => {
+                #[non_exhaustive]
+                #[allow(private_interfaces)]
+                pub enum OneOf<$($ts = NeverT),*> {
+                    $($ts($ts)),*
+                }
+
+                impl<$($ts),*> OneOf<$($ts),*> {
+                    fn expected_types() -> &'static str {
+                        static STORE: OnceLock<&'static str> = OnceLock::new();
+
+                        STORE.get_or_init(|| {
+                            let mut result = String::new();
+                            for entry in [$(type_name::<$ts>()),*] {
+                                if entry == type_name::<NeverT>() {
+                                    continue
+                                }
+
+                                if !result.is_empty() {
+                                    result.push(',');
+                                }
+
+                                result.extend(entry.chars());
+                            }
+                            result.leak()
+                        })
+                    }
+
+                    fn target_t() -> &'static str {
+                        static STORE: OnceLock<&'static str> = OnceLock::new();
+
+                        STORE.get_or_init(|| {
+                            format!("OneOf<{}>", Self::expected_types()).leak()
+                        })
+                    }
+
+                    fn type_name(&self) -> &'static str {
+                        match self {
+                            $(
+                                Self::$ts(_) => type_name::<$ts>(),
+                            )*
+                        }
+                    }
+
+                    paste::paste!{$(
+                        pub fn [<is_ $ts:lower>](&self) -> bool {
+                            match self {
+                                Self::$ts(_) => true,
+                                _ => false,
+                            }
+                        }
+                        pub fn [<as_ $ts:lower>](&self) -> Option<&$ts> {
+                            match self {
+                                Self::$ts(it) => Some(it),
+                                _ => None,
+                            }
+                        }
+                        pub fn [<unwrap_ $ts:lower>](self) -> $ts {
+                            match self {
+                                Self::$ts(it) => it,
+                                other => panic!(concat!["expected ", stringify!($ts), "; found {:?} variant instead"], other.type_name()),
+                            }
+                        }
+                    )*}
+                }
+
+                impl<'lua, $($ts),*> FromLua<'lua> for OneOf<$($ts),*> where $($ts: FromLua<'lua>),* {
+                    fn from_lua(value: Value<'lua>, lua: Context<'lua>) -> Result<Self, Error> {
+                        $(
+                            if type_name::<$ts>() != type_name::<NeverT>() { // optimize NeverT checks away
+                                if let Ok(it) = $ts::from_lua(value.clone(), lua) {
+                                    return Ok(Self::$ts(it));
+                                }
+                            }
+                        )*
+
+                        Err(Error::FromLuaConversionError {
+                            from: value.type_name(),
+                            to: Self::target_t(),
+                            message: Some(format!("unable to convert into any of expected types: {}", Self::expected_types()))
+                        })
+                    }
+                }
+            };
+        }
+
+        impl_one_of!(A B C D E F G H I J K L M N O P);
+    }
 }
