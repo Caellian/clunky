@@ -19,10 +19,7 @@ impl FrameBufferSurface for FrameBuffer {
 }
 
 pub mod ext {
-    use std::{
-        io::Cursor,
-        ptr::{addr_of, addr_of_mut},
-    };
+    use std::ptr::{addr_of, addr_of_mut};
 
     use skia_safe::{Matrix, M44};
     use thiserror::Error;

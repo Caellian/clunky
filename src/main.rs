@@ -1,8 +1,7 @@
 use std::{
     error::Error,
-    mem::MaybeUninit,
     process::exit,
-    ptr::{addr_of, addr_of_mut},
+    ptr::addr_of,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -20,7 +19,7 @@ use rlua::prelude::*;
 use script::{events::EventBuffer, settings::Settings};
 use skia_safe::{Color, Color4f};
 
-use crate::{render::buffer::FrameBuffer, script::ScriptContext};
+use crate::script::ScriptContext;
 
 mod args;
 pub mod error;

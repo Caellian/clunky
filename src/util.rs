@@ -1,5 +1,3 @@
-use skia_safe::Color4f;
-
 #[macro_export]
 macro_rules! require_some {
     ($value: expr) => {

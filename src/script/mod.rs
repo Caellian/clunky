@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{error::ClunkyError, render::frontend::bindings::LuaTypeface};
+use crate::error::ClunkyError;
 use rlua::prelude::*;
 use settings::Settings;
 
@@ -105,4 +105,51 @@ pub fn vec_to_table<'lua, T: ToLua<'lua>>(
             .enumerate()
             .map(|(i, it)| (i as LuaInteger, it)),
     )
+}
+
+pub mod ext {
+    use rlua::{Context, FromLua, Table, ToLua, Value};
+
+    use crate::error::LuaError;
+
+    pub trait TableExt<'lua> {
+        fn try_get<K: ToLua<'lua>, V: FromLua<'lua>>(
+            &self,
+            key: K,
+            lua: Context<'lua>,
+        ) -> Result<Option<V>, LuaError>;
+
+        #[inline]
+        fn try_get_or<K: ToLua<'lua>, V: FromLua<'lua>>(
+            &self,
+            key: K,
+            lua: Context<'lua>,
+            default: V,
+        ) -> Result<V, LuaError> {
+            self.try_get(key, lua).map(|it| it.unwrap_or(default))
+        }
+
+        #[inline]
+        fn try_get_or_default<K: ToLua<'lua>, V: Default + FromLua<'lua>>(
+            &self,
+            key: K,
+            lua: Context<'lua>,
+        ) -> Result<V, LuaError> {
+            self.try_get_or(key, lua, V::default())
+        }
+    }
+
+    impl<'lua> TableExt<'lua> for Table<'lua> {
+        fn try_get<K: ToLua<'lua>, V: FromLua<'lua>>(
+            &self,
+            key: K,
+            lua: Context<'lua>,
+        ) -> Result<Option<V>, LuaError> {
+            match self.get::<K, Value>(key) {
+                Ok(Value::Nil) => Ok(None),
+                Ok(other) => V::from_lua(other, lua).map(Some),
+                Err(err) => Err(err),
+            }
+        }
+    }
 }

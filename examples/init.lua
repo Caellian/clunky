@@ -6,9 +6,7 @@ primary = {
     s = 0.5,
     l = 0.6,
     anti_alias = true,
-    style = {
-        stroke = true,
-    },
+    style = "stroke",
 }
 
 function cpu_arc(canvas, position, radius, cpu_info)

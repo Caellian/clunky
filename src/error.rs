@@ -5,7 +5,6 @@ use std::{
 
 use thiserror::Error;
 
-pub(crate) type IOError = std::io::Error;
 pub type LuaError = rlua::Error;
 
 #[derive(Clone, Debug)]
@@ -34,7 +33,6 @@ impl Display for ValueType {
         match self {
             ValueType::Number => f.write_str("number"),
             ValueType::String => f.write_str("string"),
-            _ => Ok(()),
         }
     }
 }

@@ -15,8 +15,11 @@ use phf::phf_map;
 use rlua::{prelude::*, Context as LuaContext, Table as LuaTable, UserData};
 use skia_safe::{
     canvas::{self, SaveLayerFlags, SaveLayerRec},
+    color_filter::color_filters,
     font::Edging as FontEdging,
     font_style::{Slant, Weight, Width},
+    gradient_shader::interpolation::{ColorSpace as InColorSpace, HueMethod, InPremul},
+    gradient_shader::Interpolation,
     image_filter::MapDirection,
     image_filters::{self, CropRect},
     matrix::{ScaleToFit, TypeMask},
@@ -30,8 +33,22 @@ use skia_safe::{
     *,
 };
 
-use crate::{render::skia::ext::MatrixExt, script::vec_to_table, util::hsl_to_rgb};
+use crate::{
+    render::skia::ext::MatrixExt,
+    script::{ext::TableExt, vec_to_table},
+    util::hsl_to_rgb,
+};
 
+// SECTION: Utility traits
+
+/// Allows declaring a wrapper type and automatically implementing all of the
+/// remaining utility traits on that type and wrappers around it.
+trait WrapperT<'lua> {
+    type Wrapped;
+    fn unwrap(self) -> Self::Wrapped;
+}
+
+/// Mapping and unwrapping utilities for [`Option`]al values.
 trait FromLuaOption<T>: Sized {
     fn map_t(self) -> Option<T>;
 
@@ -48,6 +65,24 @@ trait FromLuaOption<T>: Sized {
     fn unwrap_or_else_t(self, value_fn: impl Fn() -> T) -> T;
 }
 
+impl<'lua, T, W: WrapperT<'lua, Wrapped = T>> FromLuaOption<T> for Option<W> {
+    #[inline(always)]
+    fn map_t(self) -> Option<T> {
+        self.map(WrapperT::unwrap)
+    }
+
+    #[inline(always)]
+    fn unwrap_or_t(self, value: T) -> T {
+        self.map(WrapperT::unwrap).unwrap_or(value)
+    }
+
+    #[inline(always)]
+    fn unwrap_or_else_t(self, value_fn: impl Fn() -> T) -> T {
+        self.map(WrapperT::unwrap).unwrap_or_else(value_fn)
+    }
+}
+
+/// Mapping and unwrapping utilities for [`Result`].
 trait FromLuaResult<T>: Sized {
     type Error;
 
@@ -66,6 +101,8 @@ trait FromLuaResult<T>: Sized {
     fn unwrap_or_else_t(self, value_fn: impl Fn() -> T) -> T;
 }
 
+/// Any [`Result`] for which [`FromLuaOption`] is implemented can be handled
+/// though that implementation as `FromLuaResult` only touches the `Ok` case.
 impl<T, F, E> FromLuaResult<T> for Result<F, E>
 where
     Option<F>: FromLuaOption<T>,
@@ -87,6 +124,46 @@ where
         self.ok().unwrap_or_else_t(value_fn)
     }
 }
+
+/// Applies TableExt to reading table values with wrapper types, automatically
+/// handling unwrapping.
+trait TableWrapperExt<'lua>: TableExt<'lua> {
+    #[inline(always)]
+    fn try_get_t<K: ToLua<'lua>, W: WrapperT<'lua> + FromLua<'lua>>(
+        &self,
+        key: K,
+        lua: LuaContext<'lua>,
+    ) -> Result<Option<W::Wrapped>, LuaError> {
+        TableExt::try_get(self, key, lua).map(|result| result.map(W::unwrap))
+    }
+
+    #[inline(always)]
+    fn try_get_or_t<K: ToLua<'lua>, W: WrapperT<'lua> + FromLua<'lua>>(
+        &self,
+        key: K,
+        lua: LuaContext<'lua>,
+        default: W::Wrapped,
+    ) -> Result<W::Wrapped, LuaError> {
+        self.try_get_t::<K, W>(key, lua)
+            .map(|it| it.unwrap_or(default))
+    }
+
+    #[inline(always)]
+    fn try_get_or_default_t<K: ToLua<'lua>, W: WrapperT<'lua> + FromLua<'lua>>(
+        &self,
+        key: K,
+        lua: LuaContext<'lua>,
+    ) -> Result<W::Wrapped, LuaError>
+    where
+        W::Wrapped: Default,
+    {
+        self.try_get_or_t::<K, W>(key, lua, W::Wrapped::default())
+    }
+}
+
+impl<'lua> TableWrapperExt<'lua> for LuaTable<'lua> {}
+
+// !SECTION
 
 macro_rules! named_enum {
     ($kind: ty: [$($value: expr => $name: literal,)+]) => {paste::paste!{
@@ -113,26 +190,12 @@ macro_rules! named_enum {
             }
         }
 
-        impl FromLuaOption<$kind> for Option<[<Lua $kind>]> {
-            #[inline]
-            fn map_t(self) -> Option<$kind> {
-                self.map(|t| t.0)
-            }
+        impl<'lua> WrapperT<'lua> for [<Lua $kind>] {
+            type Wrapped = $kind;
 
             #[inline]
-            fn unwrap_or_t(self, value: $kind) -> $kind {
-                match self {
-                    Some(it) => it.0,
-                    None => value
-                }
-            }
-
-            #[inline]
-            fn unwrap_or_else_t(self, value_fn: impl Fn() -> $kind) -> $kind {
-                match self {
-                    Some(it) => it.0,
-                    None => value_fn(),
-                }
+            fn unwrap(self) -> $kind {
+                self.0
             }
         }
 
@@ -197,7 +260,7 @@ macro_rules! named_enum {
         }
 
         impl<'lua> FromLua<'lua> for [<Lua $kind>] {
-            fn from_lua(text: LuaValue<'lua>, lua: LuaContext<'lua>) -> LuaResult<Self> {
+            fn from_lua(text: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
                 let text = match text {
                     LuaValue::String(it) => it,
                     other => {
@@ -259,12 +322,6 @@ named_enum! { BlendMode: [
     BlendMode::Saturation => "saturation",
     BlendMode::Color => "color",
     BlendMode::Luminosity => "luminosity",
-]}
-
-named_enum! { PaintStyle : [
-    PaintStyle::Fill => "fill",
-    PaintStyle::Stroke => "stroke",
-    PaintStyle::StrokeAndFill => "stroke_and_fill",
 ]}
 
 named_enum! { PaintCap : [
@@ -454,6 +511,154 @@ named_enum! { ColorChannel: [
     ColorChannel::A => "a",
 ]}
 
+named_enum! { HueMethod: [
+    HueMethod::Shorter => "shorter",
+    HueMethod::Longer => "longer",
+    HueMethod::Increasing => "increasing",
+    HueMethod::Decreasing => "decreasing",
+]}
+
+named_enum! { InColorSpace: [
+    InColorSpace::Destination => "destination",
+    InColorSpace::SRGBLinear => "srgb_linear",
+    InColorSpace::Lab => "lab",
+    InColorSpace::OKLab => "oklab",
+    InColorSpace::LCH => "lch",
+    InColorSpace::OKLCH => "oklch",
+    InColorSpace::SRGB => "srgb",
+    InColorSpace::HSL => "hsl",
+    InColorSpace::HWB => "hwb",
+]}
+
+named_enum! { BlurStyle: [
+    BlurStyle::Normal => "normal",
+    BlurStyle::Solid => "solid",
+    BlurStyle::Outer => "outer",
+    BlurStyle::Inner => "inner",
+]}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LuaInPremul(InPremul);
+
+#[allow(unused)]
+static NAME_TO_IN_PREMUL: phf::Map<&'static str, InPremul> = phf_map! {
+  "yes" => (InPremul::Yes),
+  "true" => (InPremul::Yes),
+  "no" => (InPremul::No),
+  "false" => (InPremul::No)
+};
+impl LuaInPremul {
+    fn expected_values() -> &'static str {
+        static EXPECTED: OnceLock<String> = OnceLock::new();
+        EXPECTED.get_or_init(|| [concat!("'", "yes", "'"), concat!("'", "no", "'")].join(", "))
+    }
+    pub fn unwrap(&self) -> InPremul {
+        self.0
+    }
+}
+
+impl<'lua> WrapperT<'lua> for LuaInPremul {
+    type Wrapped = InPremul;
+
+    #[inline]
+    fn unwrap(self) -> InPremul {
+        self.0
+    }
+}
+
+impl std::ops::Deref for LuaInPremul {
+    type Target = InPremul;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for LuaInPremul {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl AsRef<InPremul> for LuaInPremul {
+    #[inline]
+    fn as_ref(&self) -> &InPremul {
+        &self.0
+    }
+}
+impl<'lua> FromStr for LuaInPremul {
+    type Err = LuaError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = match NAME_TO_IN_PREMUL.get(value.to_ascii_lowercase().as_str()) {
+            Some(it) => *it,
+            None => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "string",
+                    to: stringify!(InPremul),
+                    message: Some(format!(
+                        concat![
+                            "unknown ",
+                            stringify!(InPremul),
+                            " name: '{}'; expected one of: {}"
+                        ],
+                        value,
+                        Self::expected_values()
+                    )),
+                })
+            }
+        };
+        Ok(LuaInPremul(value))
+    }
+}
+impl<'lua> TryFrom<String> for LuaInPremul {
+    type Error = LuaError;
+    #[inline(always)]
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::from_str(value.as_str())
+    }
+}
+impl<'lua> TryFrom<LuaString<'lua>> for LuaInPremul {
+    type Error = LuaError;
+    #[inline(always)]
+    fn try_from(value: LuaString<'lua>) -> Result<Self, Self::Error> {
+        Self::from_str(value.to_str()?)
+    }
+}
+impl<'lua> FromLua<'lua> for LuaInPremul {
+    fn from_lua(text: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
+        let text = match text {
+            LuaValue::String(it) => it,
+            LuaValue::Boolean(value) => {
+                return Ok(match value {
+                    true => LuaInPremul(InPremul::Yes),
+                    false => LuaInPremul(InPremul::No),
+                })
+            }
+            other => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "PaintStyle",
+                    message: Some(format!(
+                        "expected a PaintStyle string value; one of: {}",
+                        Self::expected_values()
+                    )),
+                })
+            }
+        };
+        Self::try_from(text)
+    }
+}
+impl<'lua> ToLua<'lua> for LuaInPremul {
+    #[allow(unreachable_patterns)]
+    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+        lua.create_string(match self.0 {
+            InPremul::Yes => "yes",
+            InPremul::No => "no",
+            _ => return Ok(LuaNil),
+        })
+        .map(LuaValue::String)
+    }
+}
+
 macro_rules! named_bitflags {
     ($kind: ty: [$($value: expr => $name: literal,)+]) => {paste::paste!{
         named_enum! { $kind : [
@@ -518,6 +723,155 @@ named_bitflags! { SurfacePropsFlags: [
     SurfacePropsFlags::DYNAMIC_MSAA => "dynamic_msaa",
     SurfacePropsFlags::ALWAYS_DITHER => "always_dither",
 ]}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LuaPaintStyle(PaintStyle);
+
+#[allow(unused)]
+static NAME_TO_PAINT_STYLE: phf::Map<&'static str, PaintStyle> = phf_map! {
+  "fill" => (PaintStyle::Fill),
+  "stroke" => (PaintStyle::Stroke),
+  "fill_and_stroke" => (PaintStyle::StrokeAndFill),
+  "fill,stroke" => (PaintStyle::StrokeAndFill),
+  "stroke_and_fill" => (PaintStyle::StrokeAndFill),
+  "stroke,fill" => (PaintStyle::StrokeAndFill)
+};
+
+impl LuaPaintStyle {
+    fn expected_values() -> &'static str {
+        "'fill', 'stroke', 'stroke_and_fill'"
+    }
+    pub fn unwrap(&self) -> PaintStyle {
+        self.0
+    }
+}
+impl<'lua> WrapperT<'lua> for LuaPaintStyle {
+    type Wrapped = PaintStyle;
+
+    #[inline]
+    fn unwrap(self) -> PaintStyle {
+        self.0
+    }
+}
+impl std::ops::Deref for LuaPaintStyle {
+    type Target = PaintStyle;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for LuaPaintStyle {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl AsRef<PaintStyle> for LuaPaintStyle {
+    #[inline]
+    fn as_ref(&self) -> &PaintStyle {
+        &self.0
+    }
+}
+impl<'lua> FromStr for LuaPaintStyle {
+    type Err = LuaError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = match NAME_TO_PAINT_STYLE.get(value.to_ascii_lowercase().as_str()) {
+            Some(it) => *it,
+            None => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "string",
+                    to: stringify!(PaintStyle),
+                    message: Some(format!(
+                        concat![
+                            "unknown ",
+                            stringify!(PaintStyle),
+                            " name: '{}'; expected one of: {}"
+                        ],
+                        value,
+                        Self::expected_values()
+                    )),
+                })
+            }
+        };
+        Ok(LuaPaintStyle(value))
+    }
+}
+impl<'lua> TryFrom<String> for LuaPaintStyle {
+    type Error = LuaError;
+    #[inline(always)]
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::from_str(value.as_str())
+    }
+}
+impl<'lua> TryFrom<LuaString<'lua>> for LuaPaintStyle {
+    type Error = LuaError;
+    #[inline(always)]
+    fn try_from(value: LuaString<'lua>) -> Result<Self, Self::Error> {
+        Self::from_str(value.to_str()?)
+    }
+}
+impl<'lua> FromLua<'lua> for LuaPaintStyle {
+    fn from_lua(text: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
+        let text = match text {
+            LuaValue::String(it) => it,
+            LuaValue::Table(list) => {
+                let count = list.clone().sequence_values::<String>().count();
+                let values: Vec<_> = list
+                    .sequence_values::<String>()
+                    .filter_map(Result::ok)
+                    .collect();
+
+                if values.len() != count {
+                    return Err(LuaError::FromLuaConversionError {
+                        from: "table",
+                        to: "PaintStyle",
+                        message: Some(
+                            "PaintStyle table array must contain only string values".to_string(),
+                        ),
+                    });
+                }
+
+                let fill = values.iter().any(|it| it == "fill");
+                let stroke = values.iter().any(|it| it == "stroke");
+
+                return match (fill, stroke) {
+                    (true, false) => Ok(LuaPaintStyle(PaintStyle::Fill)),
+                    (false, true) => Ok(LuaPaintStyle(PaintStyle::Fill)),
+                    (true, true) => Ok(LuaPaintStyle(PaintStyle::Fill)),
+                    (false, false) => return Err(LuaError::FromLuaConversionError {
+                        from: "table",
+                        to: "PaintStyle",
+                        message: Some("expected PaintStyle table array to contain one of (or both): 'fill', 'stroke'".to_string()),
+                    }),
+                };
+            }
+            other => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "PaintStyle",
+                    message: Some(format!(
+                        "expected a PaintStyle string value or table array; one of: {}",
+                        Self::expected_values()
+                    )),
+                })
+            }
+        };
+        Self::try_from(text)
+    }
+}
+
+impl<'lua> ToLua<'lua> for LuaPaintStyle {
+    #[allow(unreachable_patterns)]
+    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+        lua.create_string(match self.0 {
+            PaintStyle::Fill => "fill",
+            PaintStyle::Stroke => "stroke",
+            PaintStyle::StrokeAndFill => "stroke_and_fill",
+            _ => return Ok(LuaNil),
+        })
+        .map(LuaValue::String)
+    }
+}
 
 enum NeverT {}
 impl<'lua> FromLua<'lua> for NeverT {
@@ -1629,32 +1983,12 @@ macro_rules! wrap_skia_handle {
                     &self.0
                 }
             }
+            impl<'lua> WrapperT<'lua> for [<Lua $handle>] {
+                type Wrapped = $handle;
 
-            impl [<Lua $handle>] {
-                pub fn unwrap(self) -> $handle {
+                #[inline]
+                fn unwrap(self) -> $handle {
                     self.0
-                }
-            }
-            impl FromLuaOption<$handle> for Option<[<Lua $handle>]> {
-                #[inline]
-                fn map_t(self) -> Option<$handle> {
-                    self.map(|t| t.0)
-                }
-
-                #[inline]
-                fn unwrap_or_t(self, value: $handle) -> $handle {
-                    match self {
-                        Some(it) => it.0,
-                        None => value
-                    }
-                }
-
-                #[inline]
-                fn unwrap_or_else_t(self, value_fn: impl Fn() -> $handle) -> $handle {
-                    match self {
-                        Some(it) => it.0,
-                        None => value_fn(),
-                    }
                 }
             }
         }
@@ -1695,26 +2029,12 @@ macro_rules! type_like {
                     &self.0
                 }
             }
-            impl FromLuaOption<$handle> for Option<[<Like $handle>]> {
-                #[inline]
-                fn map_t(self) -> Option<$handle> {
-                    self.map(|t| t.0.0)
-                }
+            impl<'lua> WrapperT<'lua> for [<Like $handle>] {
+                type Wrapped = $handle;
 
                 #[inline]
-                fn unwrap_or_t(self, value: $handle) -> $handle {
-                    match self {
-                        Some(it) => it.0.0,
-                        None => value
-                    }
-                }
-
-                #[inline]
-                fn unwrap_or_else_t(self, value_fn: impl Fn() -> $handle) -> $handle {
-                    match self {
-                        Some(it) => it.0.0,
-                        None => value_fn(),
-                    }
+                fn unwrap(self) -> $handle {
+                    self.0.0
                 }
             }
         }
@@ -1757,7 +2077,7 @@ macro_rules! type_like_table {
 
 macro_rules! decl_constructors {
     ($handle: ident: {$(
-        fn $name: ident ($($argn: ident: $argt: ty),*) -> _ $imp: block
+        fn $name: ident ($($argn: tt: $argt: ty),*) -> _ $imp: block
     )*}) => {
         paste::paste! {
             pub struct [<$handle Constructors>];
@@ -1771,6 +2091,32 @@ macro_rules! decl_constructors {
                         );
                     )*
                 }
+            }
+        }
+    };
+}
+
+macro_rules! match_value_iter {
+    ($matched: ident as $expected: literal: $(
+        $arm: pat => $value: expr $(,)?
+    )+) => {
+        match $matched.next() {
+            $(
+                Some($arm) => $value,
+            )+
+            Some(other) => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: $expected,
+                    message: None,
+                });
+            }
+            None => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "nil",
+                    to: $expected,
+                    message: None,
+                });
             }
         }
     };
@@ -1816,6 +2162,245 @@ impl UserData for LuaShader {
         methods.add_method("isAImage", |_, this, ()| Ok(this.is_a_image()));
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct LuaInterpolation(Interpolation);
+
+impl Default for LuaInterpolation {
+    fn default() -> Self {
+        LuaInterpolation(Interpolation {
+            in_premul: InPremul::No,
+            color_space: InColorSpace::Destination,
+            hue_method: HueMethod::Shorter,
+        })
+    }
+}
+
+impl<'lua> FromLua<'lua> for LuaInterpolation {
+    fn from_lua(value: LuaValue<'lua>, lua: LuaContext<'lua>) -> LuaResult<Self> {
+        let value = match value {
+            LuaValue::Integer(value) => {
+                let flags = gradient_shader::Flags::from_bits(value as u32).ok_or(
+                    LuaError::FromLuaConversionError {
+                        from: "integer",
+                        to: "Interpolation",
+                        message: Some("invalid flags value".to_string()),
+                    },
+                )?;
+                return Ok(LuaInterpolation(Interpolation::from(flags)));
+            }
+            LuaValue::Integer(value) => {
+                let flags = gradient_shader::Flags::from_bits(value as u32).ok_or(
+                    LuaError::FromLuaConversionError {
+                        from: "integer",
+                        to: "Interpolation",
+                        message: Some("invalid flags value".to_string()),
+                    },
+                )?;
+                return Ok(LuaInterpolation(Interpolation::from(flags)));
+            }
+            LuaValue::Table(table) => table,
+            other => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "Interpolaton",
+                    message: None,
+                })
+            }
+        };
+
+        let in_premul = value.try_get_or_t::<_, LuaInPremul>("in_premul", lua, InPremul::No)?;
+        let color_space = value.try_get_or_t::<_, LuaInColorSpace>(
+            "color_space",
+            lua,
+            InColorSpace::Destination,
+        )?;
+        let hue_method =
+            value.try_get_or_t::<_, LuaHueMethod>("hue_method", lua, HueMethod::Shorter)?;
+
+        Ok(LuaInterpolation(Interpolation {
+            in_premul,
+            color_space,
+            hue_method,
+        }))
+    }
+}
+
+pub struct ColorStops {
+    positions: Vec<f32>,
+    colors: Vec<Color4f>,
+}
+
+impl<'lua> FromLuaMulti<'lua> for ColorStops {
+    fn from_lua_multi(
+        values: LuaMultiValue<'lua>,
+        _: LuaContext<'lua>,
+        consumed: &mut usize,
+    ) -> LuaResult<Self> {
+        let mut values = values.into_iter();
+        let first = match_value_iter!(values as "ColorStops":
+            LuaValue::Table(it) => it,
+        );
+
+        let key_out_of_bounds = first
+            .clone()
+            .pairs::<LuaNumber, LuaValue>()
+            .any(|it| match it {
+                Err(_) => false, // non-numeric index, ignore and assume one table
+                Ok((i, _)) => !(0.0..=1.0).contains(&i),
+            });
+
+        if !key_out_of_bounds {
+            // if user passes a table like {Color}, we ignore the next argument
+            // as well because it doesn't matter
+
+            let count = first.clone().pairs::<f32, LuaColor>().count();
+            let stops: Vec<(f32, Color4f)> = first
+                .clone()
+                .pairs::<f32, LuaColor>()
+                .filter_map(|it| match it {
+                    Ok((f, c)) => Some((f, c.into())),
+                    Err(_) => None,
+                })
+                .collect();
+
+            if stops.len() < count {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "table",
+                    to: "ColorStops",
+                    message: Some("ColorStops expects a table with only Color values".to_string()),
+                });
+            }
+
+            let (positions, colors) = stops.into_iter().unzip();
+            *consumed += 1;
+            return Ok(ColorStops { positions, colors });
+        }
+
+        let colors: Vec<Color4f> = first
+            .sequence_values::<LuaColor>()
+            .filter_map(|it| match it {
+                Ok(it) => Some(it.into()),
+                Err(_) => None,
+            })
+            .collect();
+        *consumed += 1;
+
+        let second = match values.next() {
+            Some(LuaValue::Table(it)) => Some(it),
+            Some(LuaValue::Nil) => {
+                *consumed += 1;
+                None
+            }
+            _ => None, // nil value means evenly spaced stops
+        };
+
+        let positions = if let Some(second) = second {
+            let count = second.clone().sequence_values::<f32>().count();
+            let positions: Vec<f32> = second
+                .sequence_values::<f32>()
+                .filter_map(Result::ok)
+                .collect();
+
+            if positions.len() < count {
+                None
+            } else {
+                *consumed += 1;
+                Some(positions)
+            }
+        } else {
+            None
+        };
+
+        if let Some(positions) = positions {
+            Ok(ColorStops { positions, colors })
+        } else {
+            let step = 1.0 / (colors.len() as f32 - 1.0);
+            let positions = (0..colors.len()).map(|it| it as f32 * step).collect();
+            Ok(ColorStops { positions, colors })
+        }
+    }
+}
+
+decl_constructors!(GradientShader: {
+    fn make_linear(
+        from: LuaPoint, to: LuaPoint, stops: ColorStops,
+        color_space: Option<LuaColorSpace>, tile_mode: Option<LuaTileMode>,
+        interpolation: Option<LuaInterpolation>, local: Option<LuaMatrix>
+    ) -> _ {
+        let tile_mode = tile_mode.unwrap_or_t(TileMode::Clamp);
+        let interpolation = interpolation.unwrap_or_default().0;
+        let local: Option<Matrix> = local.map(LuaMatrix::into);
+
+        Ok(Shader::linear_gradient_with_interpolation(
+            (from, to),
+            (stops.colors.as_slice(), color_space.map(LuaColorSpace::unwrap)),
+            Some(stops.positions.as_slice()),
+            tile_mode,
+            interpolation,
+            local.as_ref(),
+        ).map(LuaShader))
+    }
+    fn make_radial(
+        center: LuaPoint, radius: f32, stops: ColorStops,
+        color_space: Option<LuaColorSpace>, tile_mode: Option<LuaTileMode>,
+        interpolation: Option<LuaInterpolation>, local: Option<LuaMatrix>
+    ) -> _ {
+        let tile_mode = tile_mode.unwrap_or_t(TileMode::Clamp);
+        let interpolation = interpolation.unwrap_or_default().0;
+        let local: Option<Matrix> = local.map(LuaMatrix::into);
+
+        Ok(Shader::radial_gradient_with_interpolation(
+            (center, radius),
+            (stops.colors.as_slice(), color_space.map(LuaColorSpace::unwrap)),
+            Some(stops.positions.as_slice()),
+            tile_mode,
+            interpolation,
+            local.as_ref(),
+        ).map(LuaShader))
+    }
+    fn make_sweep(
+        center: LuaPoint, stops: ColorStops,
+        color_space: Option<LuaColorSpace>, tile_mode: Option<LuaTileMode>,
+        angles: Option<(f32, f32)>,
+        interpolation: Option<LuaInterpolation>, local: Option<LuaMatrix>
+    ) -> _ {
+        let tile_mode = tile_mode.unwrap_or_t(TileMode::Clamp);
+        let interpolation = interpolation.unwrap_or_default().0;
+        let local: Option<Matrix> = local.map(LuaMatrix::into);
+
+        Ok(Shader::sweep_gradient_with_interpolation(
+            center,
+            (stops.colors.as_slice(), color_space.map(LuaColorSpace::unwrap)),
+            Some(stops.positions.as_slice()),
+            tile_mode,
+            angles,
+            interpolation,
+            local.as_ref(),
+        ).map(LuaShader))
+    }
+    fn make_two_point_conical(
+        start: LuaPoint, start_radius: f32,
+        end: LuaPoint, end_radius: f32,
+        stops: ColorStops,
+        color_space: Option<LuaColorSpace>, tile_mode: Option<LuaTileMode>,
+        interpolation: Option<LuaInterpolation>, local: Option<LuaMatrix>
+    ) -> _ {
+        let tile_mode = tile_mode.unwrap_or_t(TileMode::Clamp);
+        let interpolation = interpolation.unwrap_or_default().0;
+        let local: Option<Matrix> = local.map(LuaMatrix::into);
+
+        Ok(Shader::two_point_conical_gradient_with_interpolation(
+            (start, start_radius),
+            (end, end_radius),
+            (stops.colors.as_slice(), color_space.map(LuaColorSpace::unwrap)),
+            Some(stops.positions.as_slice()),
+            tile_mode,
+            interpolation,
+            local.as_ref(),
+        ).map(LuaShader))
+    }
+});
 
 wrap_skia_handle!(Image);
 
@@ -2482,6 +3067,33 @@ impl UserData for LuaColorFilter {
     }
 }
 
+decl_constructors!(ColorFilters: {
+    fn blend(color: LuaColor, _: Option<LuaColorSpace>, mode: LuaBlendMode) -> _ {
+        // NYI: blend color filter color_space handling
+        let mode = mode.unwrap();
+        Ok(color_filters::blend(color, mode).map(LuaColorFilter))
+    }
+    fn compose(outer: LuaColorFilter, inner: LuaColorFilter) -> _ {
+        Ok(color_filters::compose(outer, inner).map(LuaColorFilter))
+    }
+    // TODO: ColorFilters::HSLA_matrix(matrix: LuaColorMatrix)
+    fn lerp(t: f32, source: LuaColorFilter, destination: LuaColorFilter) -> _ {
+        Ok(color_filters::lerp(t, source, destination).map(LuaColorFilter))
+    }
+    fn lighting(multiply: LuaColor, add: LuaColor) -> _ {
+        Ok(color_filters::lighting(multiply, add).map(LuaColorFilter))
+    }
+    fn linear_to_SRGB_gamma() -> _ {
+        Ok(LuaColorFilter(color_filters::linear_to_srgb_gamma()))
+    }
+    // TODO: ColorFilters::matrix(matrix: LuaColorMatrix)
+    fn SRGB_to_linear_gamma() -> _ {
+        Ok(LuaColorFilter(color_filters::srgb_to_linear_gamma()))
+    }
+    // TODO: ColorFilters::table(table: LuaColorTable)
+    // TODO: ColorFilters::table_ARGB(table: LuaColorTable)
+});
+
 wrap_skia_handle!(MaskFilter);
 
 impl UserData for LuaMaskFilter {
@@ -2492,6 +3104,12 @@ impl UserData for LuaMaskFilter {
         });
     }
 }
+
+decl_constructors!(MaskFilter: {
+    fn make_blur(style: LuaBlurStyle, sigma: f32, ctm: Option<bool>) -> _ {
+        Ok(MaskFilter::blur(style.unwrap(), sigma, ctm).map(LuaMaskFilter))
+    }
+});
 
 wrap_skia_handle!(DashInfo);
 type_like!(DashInfo);
@@ -3195,67 +3813,54 @@ impl UserData for MatrixConstructors {
 
 wrap_skia_handle!(Paint);
 
-type_like_table!(Paint: |value: LuaTable, ctx: LuaContext| {
+type_like_table!(Paint: |value: LuaTable, lua: LuaContext| {
     let mut paint = Paint::default();
 
-    let color_space = value.get::<_, LuaColorSpace>("color_space").ok().map(LuaColorSpace::unwrap);
-    if let Ok(color) = LuaColor::from_lua(LuaValue::Table(value.clone()), ctx) {
+    let color_space = value.try_get_t::<_, LuaColorSpace>("color_space", lua)?;
+    if let Ok(color) = LuaColor::from_lua(LuaValue::Table(value.clone()), lua) {
         let color: Color4f = color.into();
         paint.set_color4f(color, color_space.as_ref());
     }
 
-    // TODO: expect correct value if key present
-    if let Some(aa) = value.get::<_, bool>("anti_alias").ok() {
+    if let Some(aa) = value.try_get::<_, bool>("anti_alias", lua)? {
         paint.set_anti_alias(aa);
     }
 
-    if let Some(dither) = value.get::<_, bool>("dither").ok() {
+    if let Some(dither) = value.try_get::<_, bool>("dither",lua)? {
         paint.set_dither(dither);
     }
 
-    if let Some(image_filter) = value.get::<_, LuaImageFilter>("image_filter").ok() {
-        paint.set_image_filter(image_filter.unwrap());
+    if let Some(image_filter) = value.try_get_t::<_, LuaImageFilter>("image_filter",lua)? {
+        paint.set_image_filter(image_filter);
     }
-    if let Some(mask_filter) = value.get::<_, LuaMaskFilter>("mask_filter").ok() {
-        paint.set_mask_filter(mask_filter.unwrap());
+    if let Some(mask_filter) = value.try_get_t::<_, LuaMaskFilter>("mask_filter",lua)? {
+        paint.set_mask_filter(mask_filter);
     }
-    if let Some(color_filter) = value.get::<_, LuaColorFilter>("color_filter").ok() {
-        paint.set_color_filter(color_filter.unwrap());
+    if let Some(color_filter) = value.try_get_t::<_, LuaColorFilter>("color_filter", lua)? {
+        paint.set_color_filter(color_filter);
     }
 
-    if let Some(style) = value.get::<_, LuaTable>("style").ok() {
-        // TODO: Should support basic string, as well as array of strings
-        let fill: bool = style.get("fill").unwrap_or_default();
-        let stroke: bool = style.get("stroke").unwrap_or_default();
-        paint.set_style(match (fill, stroke) {
-            (true, false) => skia_safe::paint::Style::Fill,
-            (false, true) => skia_safe::paint::Style::Stroke,
-            (true, true) => skia_safe::paint::Style::StrokeAndFill,
-            (false, false) => {
-                return Err(LuaError::RuntimeError(
-                    "invalid paint style; neither 'fill' nor 'stroke' is true".to_string(),
-                ))
-            }
-        });
+    if let Some(style) = value.try_get_t::<_, LuaPaintStyle>("style", lua)? {
+        paint.set_style(style);
     }
-    if let Some(cap) = value.get::<_, LuaPaintCap>("stroke_cap").or(value.get::<_, LuaPaintCap>("cap")).ok() {
-        paint.set_stroke_cap(*cap);
+    if let Some(cap) = value.try_get_t::<_, LuaPaintCap>("stroke_cap", lua)?.or(value.try_get_t::<_, LuaPaintCap>("cap", lua)?) {
+        paint.set_stroke_cap(cap);
     }
-    if let Some(join) = value.get::<_, LuaPaintJoin>("stroke_join").or(value.get::<_, LuaPaintJoin>("join")).ok() {
-        paint.set_stroke_join(*join);
+    if let Some(join) = value.try_get_t::<_, LuaPaintJoin>("stroke_join", lua)?.or(value.try_get_t::<_, LuaPaintJoin>("join", lua)?) {
+        paint.set_stroke_join(join);
     }
-    if let Some(width) = value.get::<_, f32>("stroke_width").or(value.get::<_, f32>("width")).ok() {
+    if let Some(width) = value.try_get::<_, f32>("stroke_width", lua)?.or(value.try_get::<_, f32>("width", lua)?) {
         paint.set_stroke_width(width);
     }
-    if let Some(miter) = value.get::<_, f32>("stroke_miter").or(value.get::<_, f32>("miter")).ok() {
+    if let Some(miter) = value.try_get::<_, f32>("stroke_miter", lua)?.or(value.try_get::<_, f32>("miter", lua)?) {
         paint.set_stroke_miter(miter);
     }
-    if let Some(path_effect) = value.get::<_, LuaPathEffect>("path_effect").ok() {
-        paint.set_path_effect(path_effect.unwrap());
+    if let Some(path_effect) = value.try_get_t::<_, LuaPathEffect>("path_effect", lua)? {
+        paint.set_path_effect(path_effect);
     }
 
-    if let Some(shader) = value.get::<_, LuaShader>("shader").ok() {
-        paint.set_shader(Some(shader.unwrap()));
+    if let Some(shader) = value.try_get_t::<_, LuaShader>("shader", lua)? {
+        paint.set_shader(Some(shader));
     }
 
     return Ok(LuaPaint(paint))
@@ -4037,7 +4642,7 @@ impl<'lua> FromLuaMulti<'lua> for LuaSamplingOptions {
             }
             LuaValue::String(filter) => match filter.to_str().and_then(LuaFilterMode::from_str) {
                 Ok(it) => it,
-                Err(err) => return Ok(Self::default()),
+                Err(_) => return Ok(Self::default()),
             },
             _ => return Ok(Self::default()),
         };
@@ -4287,8 +4892,8 @@ impl<'lua> FromLuaMulti<'lua> for LuaText {
     ) -> LuaResult<Self> {
         let mut values = values.into_iter();
 
-        let bytes = match values.next() {
-            Some(LuaValue::String(text)) => {
+        let bytes = match_value_iter!(values as "Text":
+            LuaValue::String(text) => {
                 let text = OsString::from_str(text.to_str()?).unwrap();
                 *consumed += 1;
                 return Ok(LuaText {
@@ -4296,22 +4901,8 @@ impl<'lua> FromLuaMulti<'lua> for LuaText {
                     encoding: TextEncoding::UTF8,
                 });
             }
-            Some(LuaValue::Table(table)) => table,
-            Some(other) => {
-                return Err(LuaError::FromLuaConversionError {
-                    from: other.type_name(),
-                    to: "Text",
-                    message: None,
-                });
-            }
-            None => {
-                return Err(LuaError::FromLuaConversionError {
-                    from: "nil",
-                    to: "Text",
-                    message: None,
-                });
-            }
-        };
+            LuaValue::Table(table) => table,
+        );
         *consumed += 1;
 
         let bytes: Vec<LuaInteger> = bytes
@@ -4524,12 +5115,11 @@ impl UserData for LuaTypeface {
     }
 }
 
-// TODO: Typeface::make_empty NYI by skia_safe
-
 decl_constructors!(Typeface: {
     fn make_default() -> _ {
         Ok(LuaTypeface(Typeface::default()))
     }
+    // NYI: Typeface::make_empty by skia_safe
     fn make_from_name(family_name: String, font_style: Option<LuaFontStyle>) -> _ {
         let font_style = font_style.map(LuaFontStyle::unwrap).unwrap_or_default();
         Ok(FontMgr::default().match_family_style(family_name, font_style)
@@ -4882,7 +5472,6 @@ impl UserData for LuaFont {
             Ok(())
         });
         methods.add_method("textToGlyphs", |_, this, text: LuaText| {
-            // TODO: Allow non-u8 (u16, u32 & GlyphId) values
             this.text_to_glyphs_vec(text.text.as_bytes(), text.encoding);
             Ok(())
         });
@@ -5290,15 +5879,14 @@ macro_rules! global_constructor_fns {
     }};
 }
 
-// TODO: Add other ColorFilter constructors
 // TODO: Add other MaskFilter constructors
-// TODO: methods.add_method("newLinearGradient", |ctx, this, ()| Ok(()));
 // TODO: methods.add_method("newPictureRecorder", |ctx, this, ()| Ok(()));
+// TODO: filter conversion isn't automatic
 #[allow(non_snake_case)]
 pub fn setup<'lua>(ctx: LuaContext<'lua>) -> Result<(), rlua::Error> {
     global_constructors!(ctx:
-        ColorSpace, FontMgr, FontStyleSet, Image, ImageFilters, Matrix, Path,
-        PathEffect, RRect, Surfaces, TextBlob, Typeface
+        ColorFilters, ColorSpace, FontMgr, FontStyleSet, Image, ImageFilters,
+        Matrix, Path, PathEffect, RRect, Surfaces, TextBlob, Typeface
     );
     global_constructor_fns!(ctx:
         Font, FontStyle, Paint, Path, RRect, StrokeRec

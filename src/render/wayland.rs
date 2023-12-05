@@ -8,7 +8,7 @@ use wayland_client::{
         wl_seat, wl_shm, wl_shm_pool,
         wl_surface::{self, WlSurface},
     },
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
+    Connection, Dispatch, EventQueue, QueueHandle, WEnum,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
@@ -266,7 +266,7 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
         if let wl_registry::Event::Global {
             name,
             interface,
-            version,
+            version: _,
         } = event
         {
             match interface.as_str() {
@@ -379,8 +379,8 @@ stub_listener!(wl_shm_pool::WlShmPool);
 
 impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandState {
     fn event(
-        state: &mut Self,
-        buffer: &wl_buffer::WlBuffer,
+        _state: &mut Self,
+        _buffer: &wl_buffer::WlBuffer,
         event: wl_buffer::Event,
         _: &(),
         _: &Connection,
