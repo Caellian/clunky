@@ -94,3 +94,5 @@ pub fn lua_is_eq<'lua, A: ToLua<'lua>, B: ToLua<'lua>>(ctx: &LuaContext<'lua>, a
         .expect("invalid check expression");
     check.call((a, b)).unwrap_or_default()
 }
+
+pub use rlua_skia::ext::rlua as ext;

@@ -19,3 +19,4 @@ impl FrameBufferSurface for FrameBuffer {
 }
 
 pub use rlua_skia as bindings;
+pub use rlua_skia::ext::skia as ext;

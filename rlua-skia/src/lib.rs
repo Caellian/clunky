@@ -36,11 +36,7 @@ use skia_safe::{
 pub mod ext;
 pub mod util;
 
-use crate::{
-    ext::skia::*,
-    ext::rlua::*,
-    util::hsl_to_rgb,
-};
+use crate::{ext::rlua::*, ext::skia::*, util::hsl_to_rgb};
 
 // SECTION: Utility traits
 
@@ -4769,7 +4765,7 @@ impl UserData for LuaSurface {
                 );
                 match is_some {
                     true => {
-                        let result = vec_to_table(ctx, result)?;
+                        let result = ctx.create_table_from_vec(result)?;
                         result.set("info", LuaImageInfo(image_info))?;
                         Ok(Some(result))
                     }

@@ -102,16 +102,25 @@ pub mod skia {
 pub mod rlua {
     use rlua::{Context, Error, FromLua, Integer, Table, ToLua, Value};
 
-    #[inline]
-    pub fn vec_to_table<'lua, T: ToLua<'lua>>(
-        ctx: Context<'lua>,
-        vec: Vec<T>,
-    ) -> Result<Table<'lua>, Error> {
-        ctx.create_table_from(
-            vec.into_iter()
-                .enumerate()
-                .map(|(i, it)| (i as Integer, it)),
-        )
+    pub trait ContextExt<'lua> {
+        fn create_table_from_vec<T: ToLua<'lua> + Send>(
+            &self,
+            vec: Vec<T>,
+        ) -> Result<Table<'lua>, Error>;
+    }
+
+    impl<'lua> ContextExt<'lua> for Context<'lua> {
+        #[inline]
+        fn create_table_from_vec<T: ToLua<'lua> + Send>(
+            &self,
+            vec: Vec<T>,
+        ) -> Result<Table<'lua>, Error> {
+            self.create_table_from(
+                vec.into_iter()
+                    .enumerate()
+                    .map(|(i, it)| (i as Integer, it)),
+            )
+        }
     }
 
     pub trait TableExt<'lua> {
