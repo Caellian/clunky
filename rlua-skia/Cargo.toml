@@ -1,0 +1,17 @@
+[package]
+name = "rlua-skia"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rlua = { path = "../vendored/rlua" }
+skia-safe = { git = "https://github.com/rust-skia/rust-skia.git", rev = "03ef1ef138b5870c26b8c38d8c356d90cbecde39" }
+skia-bindings = { git = "https://github.com/rust-skia/rust-skia.git", rev = "03ef1ef138b5870c26b8c38d8c356d90cbecde39" }
+
+log = "0.4"
+
+phf = { version = "0.11", features = ["macros"] }
+paste = "1.0"
+thiserror = "1.0"
+
+byteorder = "1.5.0"

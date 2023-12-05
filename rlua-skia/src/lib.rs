@@ -33,9 +33,12 @@ use skia_safe::{
     *,
 };
 
+pub mod ext;
+pub mod util;
+
 use crate::{
-    render::skia::ext::MatrixExt,
-    script::{ext::TableExt, vec_to_table},
+    ext::skia::*,
+    ext::rlua::*,
     util::hsl_to_rgb,
 };
 
@@ -2189,7 +2192,7 @@ impl<'lua> FromLua<'lua> for LuaInterpolation {
                 )?;
                 return Ok(LuaInterpolation(Interpolation::from(flags)));
             }
-            LuaValue::Integer(value) => {
+            LuaValue::Number(value) => {
                 let flags = gradient_shader::Flags::from_bits(value as u32).ok_or(
                     LuaError::FromLuaConversionError {
                         from: "integer",
@@ -5879,7 +5882,6 @@ macro_rules! global_constructor_fns {
     }};
 }
 
-// TODO: Add other MaskFilter constructors
 // TODO: methods.add_method("newPictureRecorder", |ctx, this, ()| Ok(()));
 // TODO: filter conversion isn't automatic
 #[allow(non_snake_case)]
