@@ -63,11 +63,59 @@ macro_rules! decl_constructors {
     };
 }
 
-macro_rules! match_value_iter {
+macro_rules! decl_func_constructor {
+    ($handle: ident: |$ctx: tt| $imp: block) => {
+        paste::paste! {
+            fn [<register_ $handle:snake _constructor>]<'lua>(lua: LuaContext<'lua>) -> Result<(), LuaError> {
+                let globals = lua.globals();
+                let constructor = lua.create_function(|$ctx: LuaContext, ()| {
+                    $imp
+                })?;
+                globals.set(stringify!($handle), constructor)?;
+                Ok(())
+            }
+        }
+    };
+    ($handle: ident: |$ctx: ident, $($name: ident: $value: ident $( < $($gen: tt),* > )?),*| $imp: block) => {
+        paste::paste! {
+            fn [<register_ $handle:snake _constructor>]<'lua>(lua: LuaContext<'lua>) -> Result<(), LuaError> {
+                let globals = lua.globals();
+                let constructor = lua.create_function(|$ctx: LuaContext, args: LuaMultiValue| {
+                    let mut args = args.into_iter();
+                    $(
+                        let mut $name: LuaMultiValue = LuaMultiValue::from_vec(vec![args.next().unwrap_or(LuaNil)]);
+                        let $name: $value$(<$($gen),*>)? = FromLuaMulti::from_lua_multi(&mut $name, $ctx).map_err(|inner| LuaError::CallbackError {
+                            traceback: format!("while converting '{}' argument value", stringify!($name)),
+                            cause: std::sync::Arc::new(inner),
+                        })?;
+                    )*
+                    $imp
+                })?;
+                globals.set(stringify!($handle), constructor)?;
+                Ok(())
+            }
+        }
+    };
+    ($handle: ident: |$ctx: tt, $multi: tt| $imp: block) => {
+        paste::paste! {
+            fn [<register_ $handle:snake _constructor>]<'lua>(lua: LuaContext<'lua>) -> Result<(), LuaError> {
+                let globals = lua.globals();
+                let constructor = lua.create_function(|$ctx: LuaContext, $multi: LuaMultiValue| {
+                    $imp
+                })?;
+                globals.set(stringify!($handle), constructor)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+/* FIXME: REMOVE
+macro_rules! match_peeked_value {
     ($matched: ident as $expected: literal: $(
         $arm: pat => $value: expr $(,)?
     )+) => {
-        match $matched.next() {
+        match $matched.peek_front() {
             $(
                 Some($arm) => $value,
             )+
@@ -88,6 +136,7 @@ macro_rules! match_value_iter {
         }
     };
 }
+*/
 
 pub trait StructToTable<'lua> {
     fn to_table(&self, ctx: LuaContext<'lua>) -> LuaResult<LuaTable<'lua>>;
@@ -198,16 +247,32 @@ pub struct ColorStops {
     colors: Vec<Color4f>,
 }
 
+/// ## Supported formats
+/// - {pos: color, pos: color, ...}
+/// - {color...}, nil - uniformly spaced
+/// - {color...}, {pos...}
 impl<'lua> FromLuaMulti<'lua> for ColorStops {
-    fn from_lua_multi(
-        values: LuaMultiValue<'lua>,
-        _: LuaContext<'lua>,
-        consumed: &mut usize,
-    ) -> LuaResult<Self> {
-        let mut values = values.into_iter();
-        let first = match_value_iter!(values as "ColorStops":
-            LuaValue::Table(it) => it,
-        );
+    fn from_lua_multi(values: &mut LuaMultiValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
+        // TODO: MACRO match pop
+        let first = match values.pop_front() {
+            Some(LuaValue::Table(it)) => it,
+            Some(other) => {
+                let from = other.type_name();
+                values.push_front(other);
+                return Err(LuaError::FromLuaConversionError {
+                    from,
+                    to: "ColorStops",
+                    message: None,
+                });
+            }
+            None => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "nil",
+                    to: "ColorStops",
+                    message: None,
+                });
+            }
+        };
 
         let key_out_of_bounds = first
             .clone()
@@ -232,6 +297,7 @@ impl<'lua> FromLuaMulti<'lua> for ColorStops {
                 .collect();
 
             if stops.len() < count {
+                values.push_front(first);
                 return Err(LuaError::FromLuaConversionError {
                     from: "table",
                     to: "ColorStops",
@@ -240,10 +306,10 @@ impl<'lua> FromLuaMulti<'lua> for ColorStops {
             }
 
             let (positions, colors) = stops.into_iter().unzip();
-            *consumed += 1;
             return Ok(ColorStops { positions, colors });
         }
 
+        // TODO: check colors in color stops didn't error
         let colors: Vec<Color4f> = first
             .sequence_values::<LuaColor>()
             .filter_map(|it| match it {
@@ -251,28 +317,29 @@ impl<'lua> FromLuaMulti<'lua> for ColorStops {
                 Err(_) => None,
             })
             .collect();
-        *consumed += 1;
 
-        let second = match values.next() {
+        let positions = match values.pop_front() {
             Some(LuaValue::Table(it)) => Some(it),
-            Some(LuaValue::Nil) => {
-                *consumed += 1;
+            Some(LuaValue::Nil) => None,
+            Some(other) => {
+                values.push_front(other);
                 None
             }
-            _ => None, // nil value means evenly spaced stops
+            None => None,
         };
 
-        let positions = if let Some(second) = second {
+        let positions = if let Some(second) = positions {
             let count = second.clone().sequence_values::<f32>().count();
             let positions: Vec<f32> = second
+                .clone()
                 .sequence_values::<f32>()
                 .filter_map(Result::ok)
                 .collect();
 
             if positions.len() < count {
+                values.push_front(second);
                 None
             } else {
-                *consumed += 1;
                 Some(positions)
             }
         } else {
@@ -292,8 +359,8 @@ impl<'lua> FromLuaMulti<'lua> for ColorStops {
 decl_constructors!(GradientShader: {
     fn make_linear(
         from: LuaPoint, to: LuaPoint, stops: ColorStops,
-        color_space: Option<LuaColorSpace>, tile_mode: Option<LuaTileMode>,
-        interpolation: Option<LuaInterpolation>, local: Option<LuaMatrix>
+        color_space: LuaFallible<LuaColorSpace>, tile_mode: LuaFallible<LuaTileMode>,
+        interpolation: LuaFallible<LuaInterpolation>, local: LuaFallible<LuaMatrix>
     ) -> _ {
         let tile_mode = tile_mode.unwrap_or_t(TileMode::Clamp);
         let interpolation = interpolation.unwrap_or_default().0;
@@ -310,8 +377,8 @@ decl_constructors!(GradientShader: {
     }
     fn make_radial(
         center: LuaPoint, radius: f32, stops: ColorStops,
-        color_space: Option<LuaColorSpace>, tile_mode: Option<LuaTileMode>,
-        interpolation: Option<LuaInterpolation>, local: Option<LuaMatrix>
+        color_space: LuaFallible<LuaColorSpace>, tile_mode: LuaFallible<LuaTileMode>,
+        interpolation: LuaFallible<LuaInterpolation>, local: LuaFallible<LuaMatrix>
     ) -> _ {
         let tile_mode = tile_mode.unwrap_or_t(TileMode::Clamp);
         let interpolation = interpolation.unwrap_or_default().0;
@@ -328,9 +395,9 @@ decl_constructors!(GradientShader: {
     }
     fn make_sweep(
         center: LuaPoint, stops: ColorStops,
-        color_space: Option<LuaColorSpace>, tile_mode: Option<LuaTileMode>,
-        angles: Option<(f32, f32)>,
-        interpolation: Option<LuaInterpolation>, local: Option<LuaMatrix>
+        color_space: LuaFallible<LuaColorSpace>, tile_mode: LuaFallible<LuaTileMode>,
+        angles: LuaFallible<(f32, f32)>,
+        interpolation: LuaFallible<LuaInterpolation>, local: LuaFallible<LuaMatrix>
     ) -> _ {
         let tile_mode = tile_mode.unwrap_or_t(TileMode::Clamp);
         let interpolation = interpolation.unwrap_or_default().0;
@@ -341,7 +408,7 @@ decl_constructors!(GradientShader: {
             (stops.colors.as_slice(), color_space.map(LuaColorSpace::unwrap)),
             Some(stops.positions.as_slice()),
             tile_mode,
-            angles,
+            *angles,
             interpolation,
             local.as_ref(),
         ).map(LuaShader))
@@ -350,8 +417,8 @@ decl_constructors!(GradientShader: {
         start: LuaPoint, start_radius: f32,
         end: LuaPoint, end_radius: f32,
         stops: ColorStops,
-        color_space: Option<LuaColorSpace>, tile_mode: Option<LuaTileMode>,
-        interpolation: Option<LuaInterpolation>, local: Option<LuaMatrix>
+        color_space: LuaFallible<LuaColorSpace>, tile_mode: LuaFallible<LuaTileMode>,
+        interpolation: LuaFallible<LuaInterpolation>, local: LuaFallible<LuaMatrix>
     ) -> _ {
         let tile_mode = tile_mode.unwrap_or_t(TileMode::Clamp);
         let interpolation = interpolation.unwrap_or_default().0;
@@ -380,10 +447,10 @@ impl UserData for LuaImage {
             |_,
              this,
              (tile_x, tile_y, sampling, local_matrix): (
-                Option<LuaTileMode>,
-                Option<LuaTileMode>,
-                Option<LuaSamplingOptions>,
-                Option<LuaMatrix>,
+                LuaFallible<LuaTileMode>,
+                LuaFallible<LuaTileMode>,
+                LuaFallible<LuaSamplingOptions>,
+                LuaFallible<LuaMatrix>,
             )| {
                 let tile_modes = if tile_x.is_none() && tile_y.is_none() {
                     None
@@ -552,9 +619,9 @@ decl_constructors!(ImageFilters: {
     fn arithmetic(
         k1: f32, k2: f32, k3: f32, k4: f32,
         enforce_pm_color: bool,
-        background: Option<LuaImageFilter>,
-        foreground: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        background: LuaFallible<LuaImageFilter>,
+        foreground: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let background = background.map(LuaImageFilter::unwrap);
         let foreground = foreground.map(LuaImageFilter::unwrap);
@@ -570,9 +637,9 @@ decl_constructors!(ImageFilters: {
 
     fn blend(
         mode: LuaBlendMode,
-        background: Option<LuaImageFilter>,
-        foreground: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        background: LuaFallible<LuaImageFilter>,
+        foreground: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let background = background.map(LuaImageFilter::unwrap);
         let foreground = foreground.map(LuaImageFilter::unwrap);
@@ -586,13 +653,13 @@ decl_constructors!(ImageFilters: {
         ).map(LuaImageFilter))
     }
 
-    fn blur(sigma_x: f32, sigma_y: Option<f32>, tile_mode: Option<LuaTileMode>, input: Option<LuaImageFilter>, crop_rect: Option<LuaRect>) -> _ {
+    fn blur(sigma_x: f32, sigma_y: LuaFallible<f32>, tile_mode: LuaFallible<LuaTileMode>, input: LuaFallible<LuaImageFilter>, crop_rect: LuaFallible<LuaRect>) -> _ {
         if !sigma_x.is_finite() || sigma_x < 0f32 {
             return Err(LuaError::RuntimeError(
                 "x sigma must be a positive, finite scalar".to_string(),
             ));
         }
-        let sigma_y = match sigma_y {
+        let sigma_y = match *sigma_y {
             Some(sigma_y) if !sigma_y.is_finite() || sigma_y < 0f32 => {
                 return Err(LuaError::RuntimeError(
                     "y sigma must be a positive, finite scalar".to_string(),
@@ -614,8 +681,8 @@ decl_constructors!(ImageFilters: {
 
     fn color_filter(
         cf: LuaColorFilter,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -632,7 +699,7 @@ decl_constructors!(ImageFilters: {
             .map(LuaImageFilter))
     }
 
-    fn crop(rect: LuaRect, tile_mode: Option<LuaTileMode>, input: Option<LuaImageFilter>) -> _ {
+    fn crop(rect: LuaRect, tile_mode: LuaFallible<LuaTileMode>, input: LuaFallible<LuaImageFilter>) -> _ {
         let rect: Rect = rect.into();
         let input = input.map(LuaImageFilter::unwrap);
         Ok(image_filters::crop(&rect, tile_mode.map_t(), input)
@@ -640,16 +707,16 @@ decl_constructors!(ImageFilters: {
     }
 
     fn dilate(
-        radius_x: f32, radius_y: Option<f32>,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        radius_x: f32, radius_y: LuaFallible<f32>,
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         if !radius_x.is_finite() || radius_x < 0f32 {
             return Err(LuaError::RuntimeError(
                 "x radius must be a positive, finite scalar".to_string(),
             ));
         }
-        let radius_y = match radius_y {
+        let radius_y = match *radius_y {
             Some(radius_y) if !radius_y.is_finite() || radius_y < 0f32 => {
                 return Err(LuaError::RuntimeError(
                     "y radius must be a positive, finite scalar".to_string(),
@@ -672,9 +739,9 @@ decl_constructors!(ImageFilters: {
         x_channel_selector: LuaColorChannel,
         y_channel_selector: LuaColorChannel,
         scale: f32,
-        displacement: Option<LuaImageFilter>,
-        color: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        displacement: LuaFallible<LuaImageFilter>,
+        color: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let displacement = displacement.map(LuaImageFilter::unwrap);
         let color = color.map(LuaImageFilter::unwrap);
@@ -693,8 +760,8 @@ decl_constructors!(ImageFilters: {
         light_color: LuaColor,
         surface_scale: f32,
         kd: f32,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -712,8 +779,8 @@ decl_constructors!(ImageFilters: {
         surface_scale: f32,
         ks: f32,
         shininess: f32,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -730,8 +797,8 @@ decl_constructors!(ImageFilters: {
         sigma_x: f32,
         sigma_y: f32,
         color: LuaColor,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -748,8 +815,8 @@ decl_constructors!(ImageFilters: {
         sigma_x: f32,
         sigma_y: f32,
         color: LuaColor,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -766,8 +833,8 @@ decl_constructors!(ImageFilters: {
     }
     fn erode(
         radius_x: f32, radius_y: f32,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -780,9 +847,9 @@ decl_constructors!(ImageFilters: {
     }
     fn image(
         image: LuaImage,
-        src_rect: Option<LuaRect>,
-        dst_rect: Option<LuaRect>,
-        sampling: Option<LuaSamplingOptions>
+        src_rect: LuaFallible<LuaRect>,
+        dst_rect: LuaFallible<LuaRect>,
+        sampling: LuaFallible<LuaSamplingOptions>
     ) -> _ {
         let src_rect: Option<Rect> = src_rect.map(LuaRect::into);
         let dst_rect: Option<Rect> = dst_rect.map(LuaRect::into);
@@ -795,9 +862,9 @@ decl_constructors!(ImageFilters: {
         lens_bounds: LuaRect,
         zoom_amount: f32,
         inset: f32,
-        sampling: Option<LuaSamplingOptions>,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        sampling: LuaFallible<LuaSamplingOptions>,
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let lens_bounds: Rect = lens_bounds.into();
         let sampling: SamplingOptions = sampling.unwrap_or_default().into();
@@ -817,8 +884,8 @@ decl_constructors!(ImageFilters: {
         kernel_offset: LuaPoint,
         tile_mode: LuaTileMode,
         convolve_alpha: bool,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -833,8 +900,8 @@ decl_constructors!(ImageFilters: {
     }
     fn matrix_transform(
         matrix: LuaMatrix,
-        sampling: Option<LuaSamplingOptions>,
-        input: Option<LuaImageFilter>
+        sampling: LuaFallible<LuaSamplingOptions>,
+        input: LuaFallible<LuaImageFilter>
     ) -> _ {
         let matrix: Matrix = matrix.into();
         let sampling = sampling.unwrap_or_default();
@@ -843,7 +910,7 @@ decl_constructors!(ImageFilters: {
             &matrix, sampling, input
         ).map(LuaImageFilter))
     }
-    fn merge(filters: Vec<LuaImageFilter>, crop_rect: Option<LuaRect>) -> _ {
+    fn merge(filters: Vec<LuaImageFilter>, crop_rect: LuaFallible<LuaRect>) -> _ {
         let crop_rect: CropRect = crop_rect.map(|it| {
             let it: Rect = it.into();
             CropRect::from(it)
@@ -854,8 +921,8 @@ decl_constructors!(ImageFilters: {
     }
     fn offset(
         offset: LuaPoint,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -868,7 +935,7 @@ decl_constructors!(ImageFilters: {
     }
     fn picture(
         pic: LuaPicture,
-        target_rect: Option<LuaRect>
+        target_rect: LuaFallible<LuaRect>
     ) -> _ {
         let target_rect: Option<Rect> = target_rect.map(LuaRect::into);
         Ok(image_filters::picture(
@@ -880,8 +947,8 @@ decl_constructors!(ImageFilters: {
         light_color: LuaColor,
         surface_scale: f32,
         kd: f32,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -898,8 +965,8 @@ decl_constructors!(ImageFilters: {
         surface_scale: f32,
         ks: f32,
         shininess: f32,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -911,7 +978,7 @@ decl_constructors!(ImageFilters: {
             input, crop_rect,
         ).map(LuaImageFilter))
     }
-    fn shader(shader: LuaShader, crop_rect: Option<LuaRect>) -> _ {
+    fn shader(shader: LuaShader, crop_rect: LuaFallible<LuaRect>) -> _ {
         let crop_rect: CropRect = crop_rect.map(|it| {
             let it: Rect = it.into();
             CropRect::from(it)
@@ -929,8 +996,8 @@ decl_constructors!(ImageFilters: {
         light_color: LuaColor,
         surface_scale: f32,
         kd: f32,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -952,8 +1019,8 @@ decl_constructors!(ImageFilters: {
         surface_scale: f32,
         ks: f32,
         shininess: f32,
-        input: Option<LuaImageFilter>,
-        crop_rect: Option<LuaRect>
+        input: LuaFallible<LuaImageFilter>,
+        crop_rect: LuaFallible<LuaRect>
     ) -> _ {
         let input = input.map(LuaImageFilter::unwrap);
         let crop_rect: CropRect = crop_rect.map(|it| {
@@ -966,7 +1033,7 @@ decl_constructors!(ImageFilters: {
             input, crop_rect,
         ).map(LuaImageFilter))
     }
-    fn tile(src: LuaRect, dst: LuaRect, input: Option<LuaImageFilter>) -> _ {
+    fn tile(src: LuaRect, dst: LuaRect, input: LuaFallible<LuaImageFilter>) -> _ {
         let src: Rect = src.into();
         let dst: Rect = dst.into();
         let input = input.map(LuaImageFilter::unwrap);
@@ -1035,7 +1102,7 @@ impl UserData for LuaColorFilter {
 }
 
 decl_constructors!(ColorFilters: {
-    fn blend(color: LuaColor, _: Option<LuaColorSpace>, mode: LuaBlendMode) -> _ {
+    fn blend(color: LuaColor, _: LuaFallible<LuaColorSpace>, mode: LuaBlendMode) -> _ {
         // NYI: blend color filter color_space handling
         let mode = mode.unwrap();
         Ok(color_filters::blend(color, mode).map(LuaColorFilter))
@@ -1073,8 +1140,8 @@ impl UserData for LuaMaskFilter {
 }
 
 decl_constructors!(MaskFilter: {
-    fn make_blur(style: LuaBlurStyle, sigma: f32, ctm: Option<bool>) -> _ {
-        Ok(MaskFilter::blur(style.unwrap(), sigma, ctm).map(LuaMaskFilter))
+    fn make_blur(style: LuaBlurStyle, sigma: f32, ctm: LuaFallible<bool>) -> _ {
+        Ok(MaskFilter::blur(style.unwrap(), sigma, *ctm).map(LuaMaskFilter))
     }
 });
 
@@ -1107,35 +1174,42 @@ impl<'lua> TryFrom<LuaTable<'lua>> for LuaDashInfo {
 }
 
 impl<'lua> FromLuaMulti<'lua> for LikeDashInfo {
-    fn from_lua_multi(
-        values: LuaMultiValue<'lua>,
-        ctx: LuaContext<'lua>,
-        consumed: &mut usize,
-    ) -> LuaResult<Self> {
-        if let Ok((intervals, phase)) = FromLuaMulti::from_lua_multi(values.clone(), ctx, consumed)
-        {
-            *consumed += 2;
+    fn from_lua_multi(values: &mut LuaMultiValue<'lua>, ctx: LuaContext<'lua>) -> LuaResult<Self> {
+        if let Ok((intervals, phase)) = FromLuaMulti::from_lua_multi(values, ctx) {
             return Ok(LikeDashInfo(LuaDashInfo(DashInfo { intervals, phase })));
         }
 
-        let value = values.into_iter().next().unwrap_or(LuaNil);
+        let value = values.pop_front();
         let table = match value {
-            LuaValue::UserData(ud) if ud.is::<LuaDashInfo>() => {
-                *consumed += 1;
+            Some(LuaValue::UserData(ud)) if ud.is::<LuaDashInfo>() => {
                 return Ok(LikeDashInfo(ud.borrow::<LuaDashInfo>()?.to_owned()));
             }
-            LuaValue::Table(it) => it,
-            other => {
+            Some(LuaValue::Table(it)) => it.clone(),
+            Some(other) => {
+                let from = other.type_name();
+                values.push_front(other);
                 return Err(LuaError::FromLuaConversionError {
-                    from: other.type_name(),
+                    from,
+                    to: "DashInfo",
+                    message: Some("expected DashInfo or constructor Table".to_string()),
+                });
+            }
+            None => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "nil",
                     to: "DashInfo",
                     message: Some("expected DashInfo or constructor Table".to_string()),
                 });
             }
         };
-        let result = LuaDashInfo::try_from(table).map(LikeDashInfo)?;
-        *consumed += 1;
-        Ok(result)
+
+        match LuaDashInfo::try_from(table.clone()) {
+            Ok(it) => Ok(LikeDashInfo(it)),
+            Err(err) => {
+                values.push_front(table);
+                return Err(err);
+            }
+        }
     }
 }
 
@@ -1212,53 +1286,6 @@ impl UserData for LuaStrokeRec {
             Ok(this.has_equal_effect(&other))
         });
     }
-}
-
-macro_rules! decl_func_constructor {
-    ($handle: ident: |$ctx: tt| $imp: block) => {
-        paste::paste! {
-            fn [<register_ $handle:snake _constructor>]<'lua>(lua: LuaContext<'lua>) -> Result<(), LuaError> {
-                let globals = lua.globals();
-                let constructor = lua.create_function(|$ctx: LuaContext, ()| {
-                    $imp
-                })?;
-                globals.set(stringify!($handle), constructor)?;
-                Ok(())
-            }
-        }
-    };
-    ($handle: ident: |$ctx: ident, $($name: ident: $value: ident $( < $($gen: tt),* > )?),*| $imp: block) => {
-        paste::paste! {
-            fn [<register_ $handle:snake _constructor>]<'lua>(lua: LuaContext<'lua>) -> Result<(), LuaError> {
-                let globals = lua.globals();
-                let constructor = lua.create_function(|$ctx: LuaContext, args: LuaMultiValue| {
-                    let mut args = args.into_iter();
-                    $(
-                        let $name: LuaValue = args.next().unwrap_or(LuaNil);
-                        let $name: $value$(<$($gen),*>)? = FromLuaMulti::from_lua_multi(LuaMultiValue::from_vec(vec![$name]), $ctx, &mut 0).map_err(|inner| LuaError::CallbackError {
-                            traceback: format!("while converting '{}' argument value", stringify!($name)),
-                            cause: std::sync::Arc::new(inner),
-                        })?;
-                    )*
-                    $imp
-                })?;
-                globals.set(stringify!($handle), constructor)?;
-                Ok(())
-            }
-        }
-    };
-    ($handle: ident: |$ctx: tt, $multi: tt| $imp: block) => {
-        paste::paste! {
-            fn [<register_ $handle:snake _constructor>]<'lua>(lua: LuaContext<'lua>) -> Result<(), LuaError> {
-                let globals = lua.globals();
-                let constructor = lua.create_function(|$ctx: LuaContext, $multi: LuaMultiValue| {
-                    $imp
-                })?;
-                globals.set(stringify!($handle), constructor)?;
-                Ok(())
-            }
-        }
-    };
 }
 
 decl_func_constructor!(StrokeRec: |ctx, args| {
@@ -1397,14 +1424,14 @@ decl_constructors!(PathEffect: {
                 .map(LuaPathEffect),
         )
     }
-    fn make_trim(start: f32, stop: f32, mode: Option<LuaTrimMode>) -> _ {
+    fn make_trim(start: f32, stop: f32, mode: LuaFallible<LuaTrimMode>) -> _ {
         Ok(skia_safe::trim_path_effect::new(start, stop, mode.map_t()).map(LuaPathEffect))
     }
     fn make_radius(radius: f32) -> _ {
         Ok(skia_safe::corner_path_effect::new(radius).map(LuaPathEffect))
     }
-    fn make_discrete(length: f32, dev: f32, seed: Option<u32>) -> _ {
-        Ok(skia_safe::discrete_path_effect::new(length, dev, seed).map(LuaPathEffect))
+    fn make_discrete(length: f32, dev: f32, seed: LuaFallible<u32>) -> _ {
+        Ok(skia_safe::discrete_path_effect::new(length, dev, *seed).map(LuaPathEffect))
     }
     fn make_2D_path(width: f32, mx: LuaMatrix) -> _ {
         let mx: Matrix = mx.into();
@@ -2276,10 +2303,10 @@ impl UserData for LuaPath {
 }
 
 decl_constructors!(Path: {
-    fn make(points: Vec<LuaPoint>, verbs: Vec<LuaVerb>, conic_weights: Vec<f32>, fill_type: LuaPathFillType, volatile: Option<bool>) -> _ {
+    fn make(points: Vec<LuaPoint>, verbs: Vec<LuaVerb>, conic_weights: Vec<f32>, fill_type: LuaPathFillType, volatile: LuaFallible<bool>) -> _ {
         let points: Vec<Point> = points.into_iter().map(LuaPoint::into).collect();
         let verbs: Vec<u8> = verbs.into_iter().map(|it| it.0 as u8).collect();
-        Ok(LuaPath(Path::new_from(&points, &verbs, &conic_weights, *fill_type, volatile)))
+        Ok(LuaPath(Path::new_from(&points, &verbs, &conic_weights, *fill_type, *volatile)))
     }
 });
 decl_func_constructor!(Path: |_| {
@@ -2574,19 +2601,17 @@ impl Default for LuaSamplingOptions {
     }
 }
 
+/// ## Supported formats
+/// - { filter: Filter, mipmap: Mipmap }
+/// - FilterMode, Mipmap
 impl<'lua> FromLuaMulti<'lua> for LuaSamplingOptions {
-    fn from_lua_multi(
-        values: LuaMultiValue<'lua>,
-        _: LuaContext<'lua>,
-        consumed: &mut usize,
-    ) -> LuaResult<Self> {
-        let mut values = values.into_iter();
-        let first = match values.next() {
+    fn from_lua_multi(values: &mut LuaMultiValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
+        let first = match values.pop_front() {
             Some(it) => it,
             None => return Ok(Self::default()),
         };
 
-        let first = match first {
+        let filter_mode = match first.clone() {
             LuaValue::Table(table) => {
                 let filter = table
                     .get::<_, String>("filter")
@@ -2598,9 +2623,9 @@ impl<'lua> FromLuaMulti<'lua> for LuaSamplingOptions {
                     .and_then(LuaMipmapMode::try_from);
 
                 if filter.is_err() && mipmap.is_err() {
+                    values.push_front(table);
                     return Ok(Self::default());
                 }
-                *consumed += 1;
 
                 return Ok(LuaSamplingOptions {
                     filter_mode: filter.unwrap_or_t(FilterMode::Nearest),
@@ -2609,17 +2634,28 @@ impl<'lua> FromLuaMulti<'lua> for LuaSamplingOptions {
             }
             LuaValue::String(filter) => match filter.to_str().and_then(LuaFilterMode::from_str) {
                 Ok(it) => it,
-                Err(_) => return Ok(Self::default()),
+                Err(_) => {
+                    values.push_front(filter);
+                    return Ok(Self::default());
+                }
             },
-            _ => return Ok(Self::default()),
+            other => {
+                values.push_front(other);
+                return Ok(Self::default());
+            }
         };
 
         const SECOND_MISSING: &'static str = "only filtering mode provided; unpacked SamplingOptions require both filtering and mipmapping to be specified to avoid ambiguity";
 
-        let second = match values.next() {
+        let second = match values.pop_front() {
             Some(LuaValue::String(it)) => it,
             other => {
-                let other = match other {
+                // this is a weird edge case with FromLuaMulti where unpacked
+                // values completely overlap so if the second one is missing
+                // it's unclear whether the caller wanted to specify filtering
+                // or mipmapping mode and thus an error must be returned
+
+                let from = match other {
                     Some(LuaValue::Boolean(_)) => "string, boolean",
                     Some(LuaValue::LightUserData(_)) => "string, lightuserdata",
                     Some(LuaValue::Integer(_)) => "string, integer",
@@ -2633,12 +2669,13 @@ impl<'lua> FromLuaMulti<'lua> for LuaSamplingOptions {
                     Some(LuaNil) | None => "string, nil",
                 };
 
-                // this is a weird edge case with FromLuaMulti where unpacked
-                // values completely overlap so if the second one is missing
-                // it's unclear whether the caller wanted to specify filtering
-                // or mipmapping mode and thus an error must be returned
+                if let Some(other) = other {
+                    values.push_front(other);
+                }
+                values.push_front(first);
+
                 return Err(LuaError::FromLuaConversionError {
-                    from: other,
+                    from,
                     to: "SamplingOptions",
                     message: Some(SECOND_MISSING.to_string()),
                 });
@@ -2648,17 +2685,18 @@ impl<'lua> FromLuaMulti<'lua> for LuaSamplingOptions {
         let second = match second.to_str().and_then(LuaMipmapMode::from_str) {
             Ok(it) => it,
             Err(err) => {
+                values.push_front(second);
+                values.push_front(first);
+
                 return Err(LuaError::CallbackError {
                     traceback: SECOND_MISSING.to_string(),
                     cause: Arc::new(err),
-                })
+                });
             }
         };
 
-        *consumed += 2;
-
         Ok(LuaSamplingOptions {
-            filter_mode: *first,
+            filter_mode: *filter_mode,
             mipmap_mode: *second,
         })
     }
@@ -2684,8 +2722,8 @@ impl UserData for LuaSurface {
              (canvas, offset, sampling, paint): (
                 LuaCanvas,
                 LuaPoint,
-                Option<LuaSamplingOptions>,
-                Option<LikePaint>,
+                LuaFallible<LuaSamplingOptions>,
+                LuaFallible<LikePaint>,
             )| {
                 let sampling: SamplingOptions = sampling.unwrap_or_default().into();
                 let paint = paint.map(LikePaint::unwrap);
@@ -2748,8 +2786,8 @@ impl UserData for LuaSurface {
              (dst, data, info, size): (
                 LuaPoint,
                 LuaTable,
-                Option<LikeImageInfo>,
-                Option<LuaSize>,
+                LuaFallible<LikeImageInfo>,
+                LuaFallible<LuaSize>,
             )| {
                 let info = info
                     .or_else(|| data.get("info").ok())
@@ -2793,10 +2831,10 @@ decl_constructors!(Surfaces: {
         let size: ISize = size.into();
         Ok(surfaces::null(size).map(LuaSurface))
     }
-    fn raster(info: LikeImageInfo, row_bytes: Option<usize>, props: Option<LikeSurfaceProps>) -> _ {
+    fn raster(info: LikeImageInfo, row_bytes: LuaFallible<usize>, props: LuaFallible<LikeSurfaceProps>) -> _ {
         let info: ImageInfo = info.unwrap();
         let row_bytes = row_bytes.unwrap_or_else(|| info.min_row_bytes());
-        let props: Option<SurfaceProps> = props.map_t();
+        let props: Option<SurfaceProps> = props.into_option().map_t();
 
         Ok(surfaces::raster(
             &info,
@@ -2852,25 +2890,34 @@ fn encoding_size(encoding: TextEncoding) -> usize {
 }
 
 impl<'lua> FromLuaMulti<'lua> for LuaText {
-    fn from_lua_multi(
-        values: LuaMultiValue<'lua>,
-        _: LuaContext<'lua>,
-        consumed: &mut usize,
-    ) -> LuaResult<Self> {
-        let mut values = values.into_iter();
-
-        let bytes = match_value_iter!(values as "Text":
-            LuaValue::String(text) => {
+    fn from_lua_multi(values: &mut LuaMultiValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
+        // TODO: MACRO match pop
+        let bytes = match values.pop_front() {
+            Some(LuaValue::String(text)) => {
                 let text = OsString::from_str(text.to_str()?).unwrap();
-                *consumed += 1;
                 return Ok(LuaText {
                     text,
                     encoding: TextEncoding::UTF8,
                 });
             }
-            LuaValue::Table(table) => table,
-        );
-        *consumed += 1;
+            Some(LuaValue::Table(table)) => table,
+            Some(other) => {
+                let from = other.type_name();
+                values.push_front(other);
+                return Err(LuaError::FromLuaConversionError {
+                    from,
+                    to: "Text",
+                    message: None,
+                });
+            }
+            None => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "nil",
+                    to: "Text",
+                    message: None,
+                });
+            }
+        };
 
         let bytes: Vec<LuaInteger> = bytes
             .sequence_values::<LuaInteger>()
@@ -2878,16 +2925,20 @@ impl<'lua> FromLuaMulti<'lua> for LuaText {
             .filter_map(Result::ok)
             .collect();
 
-        let encoding = match values.next() {
+        let encoding = match values.pop_front() {
             Some(LuaValue::String(encoding)) => {
-                if let Ok(it) = LuaTextEncoding::try_from(encoding) {
-                    *consumed += 1;
+                if let Ok(it) = LuaTextEncoding::try_from(encoding.clone()) {
                     *it
                 } else {
+                    values.push_front(LuaValue::String(encoding));
                     TextEncoding::UTF8
                 }
             }
-            _ => TextEncoding::UTF8,
+            Some(other) => {
+                values.push_front(other);
+                TextEncoding::UTF8
+            }
+            None => TextEncoding::UTF8,
         };
 
         let text = if matches!(encoding, TextEncoding::UTF8) {
@@ -3087,16 +3138,16 @@ decl_constructors!(Typeface: {
         Ok(LuaTypeface(Typeface::default()))
     }
     // NYI: Typeface::make_empty by skia_safe
-    fn make_from_name(family_name: String, font_style: Option<LuaFontStyle>) -> _ {
+    fn make_from_name(family_name: String, font_style: LuaFallible<LuaFontStyle>) -> _ {
         let font_style = font_style.map(LuaFontStyle::unwrap).unwrap_or_default();
         Ok(FontMgr::default().match_family_style(family_name, font_style)
             .map(LuaTypeface))
     }
-    fn make_from_data(data: Vec<u8>, index: Option<usize>) -> _ {
+    fn make_from_data(data: Vec<u8>, index: LuaFallible<usize>) -> _ {
         Ok(FontMgr::default().new_from_data(&data, index.unwrap_or_default())
             .map(LuaTypeface))
     }
-    fn make_from_file(path: String, index: Option<usize>) -> _ {
+    fn make_from_file(path: String, index: LuaFallible<usize>) -> _ {
         let data = match std::fs::read(path.as_str()) {
             Ok(it) => it,
             Err(_) => return Err(LuaError::RuntimeError(
@@ -3311,7 +3362,7 @@ impl UserData for LuaFont {
         });
         methods.add_method(
             "getPos",
-            |_, this, (glyphs, origin): (Vec<GlyphId>, Option<LuaPoint>)| {
+            |_, this, (glyphs, origin): (Vec<GlyphId>, LuaFallible<LuaPoint>)| {
                 let mut points = [Point::new(0., 0.)].repeat(glyphs.len());
                 let origin = origin.map(LuaPoint::into);
                 this.get_pos(&glyphs, &mut points, origin);
@@ -3614,7 +3665,7 @@ impl<'a> std::ops::Deref for LuaCanvas<'a> {
 
 impl<'a> UserData for LuaCanvas<'a> {
     fn add_methods<'lua, T: LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
-        methods.add_method("clear", |_, this, (color,): (Option<LuaColor>,)| {
+        methods.add_method("clear", |_, this, color: LuaFallible<LuaColor>| {
             let color = color
                 .map(LuaColor::into)
                 .unwrap_or(skia_safe::colors::TRANSPARENT);
@@ -3623,7 +3674,7 @@ impl<'a> UserData for LuaCanvas<'a> {
         });
         methods.add_method(
             "drawColor",
-            |_, this, (color, blend_mode): (LuaColor, Option<LuaBlendMode>)| {
+            |_, this, (color, blend_mode): (LuaColor, LuaFallible<LuaBlendMode>)| {
                 this.draw_color(color, blend_mode.map_t());
                 Ok(())
             },
@@ -3657,7 +3708,7 @@ impl<'a> UserData for LuaCanvas<'a> {
         );
         methods.add_method(
             "drawImage",
-            |_, this, (image, point, paint): (LuaImage, LuaPoint, Option<LikePaint>)| {
+            |_, this, (image, point, paint): (LuaImage, LuaPoint, LuaFallible<LikePaint>)| {
                 this.draw_image(image.unwrap(), point, paint.map(LikePaint::unwrap).as_ref());
                 Ok(())
             },
@@ -3698,8 +3749,8 @@ impl<'a> UserData for LuaCanvas<'a> {
              this,
              (cubics_table, colors, tex_coords, blend_mode, paint): (
                 Vec<LuaPoint>,
-                Option<Vec<LuaColor>>,
-                Option<Vec<LuaPoint>>,
+                LuaFallible<Vec<LuaColor>>,
+                LuaFallible<Vec<LuaPoint>>,
                 LuaBlendMode,
                 LikePaint,
             )| {
@@ -3713,7 +3764,7 @@ impl<'a> UserData for LuaCanvas<'a> {
                     cubics[i] = cubics_table[i].into();
                 }
 
-                let colors = match colors {
+                let colors = match colors.into_option() {
                     Some(colors) => {
                         let mut result = [Color::TRANSPARENT; 4];
                         for i in 0..4 {
@@ -3724,7 +3775,7 @@ impl<'a> UserData for LuaCanvas<'a> {
                     None => None,
                 };
 
-                let tex_coords = match tex_coords {
+                let tex_coords = match tex_coords.into_option() {
                     Some(coords) => {
                         if coords.len() != 4 {
                             return Err(LuaError::RuntimeError(
@@ -3759,7 +3810,13 @@ impl<'a> UserData for LuaCanvas<'a> {
         );
         methods.add_method(
             "drawPicture",
-            |_, this, (picture, matrix, paint): (LuaPicture, Option<LuaMatrix>, Option<LikePaint>)| {
+            |_,
+             this,
+             (picture, matrix, paint): (
+                LuaPicture,
+                LuaFallible<LuaMatrix>,
+                LuaFallible<LikePaint>,
+            )| {
                 let matrix: Option<Matrix> = matrix.map(LuaMatrix::into);
                 let paint: Option<Paint> = paint.map(LikePaint::unwrap);
                 this.draw_picture(picture, matrix.as_ref(), paint.as_ref());
@@ -3792,7 +3849,7 @@ impl<'a> UserData for LuaCanvas<'a> {
             this.restore_to_count(count);
             Ok(())
         });
-        methods.add_method("scale", |_, this, (sx, sy): (f32, Option<f32>)| {
+        methods.add_method("scale", |_, this, (sx, sy): (f32, LuaFallible<f32>)| {
             let sy = sy.unwrap_or(sx);
             this.scale((sx, sy));
             Ok(())
@@ -3803,7 +3860,7 @@ impl<'a> UserData for LuaCanvas<'a> {
         });
         methods.add_method(
             "rotate",
-            |_, this, (degrees, point): (f32, Option<LuaPoint>)| {
+            |_, this, (degrees, point): (f32, LuaFallible<LuaPoint>)| {
                 let point = point.map(LuaPoint::into);
                 this.rotate(degrees, point);
                 Ok(())
@@ -3818,7 +3875,7 @@ impl<'a> UserData for LuaCanvas<'a> {
         });
         methods.add_method(
             "newSurface",
-            |_, this, (info, props): (LikeImageInfo, Option<LikeSurfaceProps>)| {
+            |_, this, (info, props): (LikeImageInfo, LuaFallible<LikeSurfaceProps>)| {
                 this.new_surface(&info, props.map(|it| *it).as_ref());
                 Ok(())
             },

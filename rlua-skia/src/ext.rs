@@ -268,5 +268,26 @@ pub mod rlua {
         }
 
         impl_one_of!(A B C D E F G H I J K L M N O P);
+
+        /*
+        /// A vec that can be read as either a table or a flat sequence of `T`
+        /// arguments.
+        pub struct FlatVec<T>(pub Vec<T>);
+
+        impl<'lua, T: FromLuaMulti<'lua>> FromLuaMulti<'lua> for FlatVec<T> {
+            fn from_lua_multi(
+                values: &mut MultiValue<'lua>,
+                lua: Context<'lua>,
+            ) -> rlua::prelude::LuaResult<Self> {
+                let mut values = values.into_iter();
+                let first = match values.next() {
+                    Some(it) => it,
+                    None => return Ok(FlatVec(vec![])),
+                };
+                if let Ok(direct) = FromLua::from_lua(first, lua) {
+                    return Ok(FlatVec(direct));
+                }
+            }
+        } */
     }
 }

@@ -325,9 +325,8 @@ impl Into<ISize> for LuaSize {
 }
 impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaSize<N> {
     fn from_lua_multi(
-        values: LuaMultiValue<'lua>,
-        _: LuaContext<'lua>,
-        consumed: &mut usize,
+        values: &mut LuaMultiValue<'lua>,
+        _lua: LuaContext<'lua>,
     ) -> LuaResult<Self> {
         if values.is_empty() {
             return Err(LuaError::FromLuaConversionError {
@@ -339,9 +338,8 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaSize<N> {
                 )),
             });
         }
-        let mut values = values.into_iter();
 
-        let first = match values.next() {
+        let first = match values.pop_front() {
             Some(it) => it,
             None => {
                 return Err(LuaError::FromLuaConversionError {
@@ -390,23 +388,20 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaSize<N> {
         match first {
             LuaValue::Table(table) => {
                 let result = Self::try_from(table)?;
-                *consumed += 1;
                 Ok(result)
             }
             LuaValue::Number(x) => {
                 let mut value = [x as f32; N];
                 for i in 1..N {
-                    value[i] = read_coord::<N>(values.next())?;
+                    value[i] = read_coord::<N>(values.pop_front())?;
                 }
-                *consumed += N;
                 Ok(LuaSize { value })
             }
             LuaValue::Integer(x) => {
                 let mut value = [x as f32; N];
                 for i in 1..N {
-                    value[i] = read_coord::<N>(values.next())?;
+                    value[i] = read_coord::<N>(values.pop_front())?;
                 }
-                *consumed += N;
                 Ok(LuaSize { value })
             }
             other => {
@@ -578,9 +573,8 @@ impl Into<Point3> for LuaPoint<3> {
 
 impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
     fn from_lua_multi(
-        values: LuaMultiValue<'lua>,
+        values: &mut LuaMultiValue<'lua>,
         _: LuaContext<'lua>,
-        consumed: &mut usize,
     ) -> LuaResult<Self> {
         if values.is_empty() {
             return Err(LuaError::FromLuaConversionError {
@@ -592,9 +586,8 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
                 )),
             });
         }
-        let mut values = values.into_iter();
 
-        let first = match values.next() {
+        let first = match values.pop_front() {
             Some(it) => it,
             None => {
                 return Err(LuaError::FromLuaConversionError {
@@ -630,6 +623,7 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
             }
         }
 
+        // TODO: repeated
         #[inline]
         fn read_coord<const N: usize>(it: Option<LuaValue>) -> Result<f32, LuaError> {
             let it = it.ok_or_else(missing_argument::<N>)?;
@@ -643,23 +637,20 @@ impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
         match first {
             LuaValue::Table(table) => {
                 let result = Self::try_from(table)?;
-                *consumed += 1;
                 Ok(result)
             }
             LuaValue::Number(x) => {
                 let mut value = [x as f32; N];
                 for i in 1..N {
-                    value[i] = read_coord::<N>(values.next())?;
+                    value[i] = read_coord::<N>(values.pop_front())?;
                 }
-                *consumed += N;
                 Ok(LuaPoint { value })
             }
             LuaValue::Integer(x) => {
                 let mut value = [x as f32; N];
                 for i in 1..N {
-                    value[i] = read_coord::<N>(values.next())?;
+                    value[i] = read_coord::<N>(values.pop_front())?;
                 }
-                *consumed += N;
                 Ok(LuaPoint { value })
             }
             other => {
@@ -772,12 +763,9 @@ pub struct SidePack {
 
 impl<'lua> FromLuaMulti<'lua> for SidePack {
     fn from_lua_multi(
-        values: LuaMultiValue<'lua>,
+        values: &mut LuaMultiValue<'lua>,
         _: LuaContext<'lua>,
-        consumed: &mut usize,
     ) -> LuaResult<Self> {
-        let mut values = values.into_iter();
-
         #[inline(always)]
         fn bad_argument_count() -> LuaError {
             LuaError::FromLuaConversionError {
@@ -787,7 +775,7 @@ impl<'lua> FromLuaMulti<'lua> for SidePack {
             }
         }
 
-        let first = values.next().ok_or_else(|| LuaError::CallbackError {
+        let first = values.pop_front().ok_or_else(|| LuaError::CallbackError {
             traceback: "expected a Side argument pack or table".to_string(),
             cause: Arc::new(LuaError::FromLuaConversionError {
                 from: "nil",
@@ -798,7 +786,6 @@ impl<'lua> FromLuaMulti<'lua> for SidePack {
 
         match first {
             LuaValue::Table(table) => {
-                *consumed += 1;
                 Self::try_from(table)
             }
             LuaValue::Integer(_) | LuaValue::Number(_) => {
@@ -810,10 +797,10 @@ impl<'lua> FromLuaMulti<'lua> for SidePack {
                 });
                 numbers.extend(
                     values
-                        .take(3)
+                        .peek_front_n(3)
                         .map(|it| match it {
-                            LuaValue::Integer(it) => Some(it as f32),
-                            LuaValue::Number(it) => Some(it as f32),
+                            LuaValue::Integer(it) => Some(*it as f32),
+                            LuaValue::Number(it) => Some(*it as f32),
                             _ => None,
                         })
                         .take_while(Option::is_some)
@@ -824,7 +811,6 @@ impl<'lua> FromLuaMulti<'lua> for SidePack {
                     1 => unsafe {
                         // SAFETY: numbers length checked by outer match
                         let all = *numbers.get(0).unwrap_unchecked();
-                        *consumed += 1;
                         Ok(SidePack {
                             left: all,
                             top: all,
@@ -836,7 +822,7 @@ impl<'lua> FromLuaMulti<'lua> for SidePack {
                         // SAFETY: numbers length checked by outer match
                         let vertical = *numbers.get(0).unwrap_unchecked();
                         let horizontal = *numbers.get(1).unwrap_unchecked();
-                        *consumed += 2;
+                        let _ = values.pop_front();
                         Ok(SidePack {
                             left: horizontal,
                             top: vertical,
@@ -850,7 +836,7 @@ impl<'lua> FromLuaMulti<'lua> for SidePack {
                         let top = *numbers.get(1).unwrap_unchecked();
                         let right = *numbers.get(2).unwrap_unchecked();
                         let bottom = *numbers.get(3).unwrap_unchecked();
-                        *consumed += 4;
+                        values.pop_front_n(3).count();
                         Ok(SidePack {
                             left,
                             top,
