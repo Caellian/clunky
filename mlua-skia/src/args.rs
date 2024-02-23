@@ -1,7 +1,12 @@
+//! This module contains representations of skia types that are used as
+//! arguments.
+
 use std::{collections::VecDeque, sync::Arc};
 
-use rlua::prelude::*;
+use mlua::prelude::*;
 use skia_safe::{Color, Color4f, IPoint, IRect, ISize, Point, Point3, Rect};
+
+use crate::{from_lua_argpack, ArgumentContext, FromArgPack, LuaType};
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct LuaColor {
@@ -23,7 +28,7 @@ impl Default for LuaColor {
 }
 
 impl<'lua> FromLua<'lua> for LuaColor {
-    fn from_lua(value: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
+    fn from_lua(value: LuaValue<'lua>, _: &'lua Lua) -> LuaResult<Self> {
         let color = match value {
             LuaValue::Table(it) => it,
             other => {
@@ -93,15 +98,16 @@ impl<'lua> FromLua<'lua> for LuaColor {
         }
     }
 }
+from_lua_argpack!(LuaColor);
 
-impl<'lua> ToLua<'lua> for LuaColor {
-    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+impl<'lua> IntoLua<'lua> for LuaColor {
+    fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
         let result = lua.create_table()?;
         result.set("r", self.r)?;
         result.set("g", self.g)?;
         result.set("b", self.b)?;
         result.set("a", self.a)?;
-        result.to_lua(lua)
+        result.into_lua(lua)
     }
 }
 
@@ -151,7 +157,7 @@ pub struct LuaRect {
 }
 
 impl<'lua> FromLua<'lua> for LuaRect {
-    fn from_lua(value: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
+    fn from_lua(value: LuaValue<'lua>, _: &'lua Lua) -> LuaResult<Self> {
         let rect = match value {
             LuaValue::Table(it) => it,
             other => {
@@ -233,15 +239,16 @@ impl<'lua> FromLua<'lua> for LuaRect {
         })
     }
 }
+from_lua_argpack!(LuaRect);
 
-impl<'lua> ToLua<'lua> for LuaRect {
-    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+impl<'lua> IntoLua<'lua> for LuaRect {
+    fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
         let result = lua.create_table()?;
         result.set("top", self.from.x())?;
         result.set("left", self.from.y())?;
         result.set("right", self.to.x())?;
         result.set("bottom", self.to.y())?;
-        result.to_lua(lua)
+        result.into_lua(lua)
     }
 }
 
@@ -290,8 +297,8 @@ pub struct LuaSize<const N: usize = 2> {
     value: [f32; N],
 }
 
-const DIM_NAME: &[&'static str] = &["width", "height", "depth"];
-const DIM_NAME_SHORT: &[&'static str] = &["w", "h", "d"];
+const DIM_NAME: &[&str] = &["width", "height", "depth"];
+const DIM_NAME_SHORT: &[&str] = &["w", "h", "d"];
 
 impl<const N: usize> LuaSize<N> {
     #[inline(always)]
@@ -323,104 +330,26 @@ impl Into<ISize> for LuaSize {
         }
     }
 }
-impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaSize<N> {
-    fn from_lua_multi(
-        values: &mut LuaMultiValue<'lua>,
-        _lua: LuaContext<'lua>,
-    ) -> LuaResult<Self> {
-        if values.is_empty() {
-            return Err(LuaError::FromLuaConversionError {
-                from: "...",
-                to: "Size",
-                message: Some(format!(
-                    "Size value expects either an array with {0} values or {0} number values",
-                    N
-                )),
-            });
-        }
-
-        let first = match values.pop_front() {
-            Some(it) => it,
-            None => {
-                return Err(LuaError::FromLuaConversionError {
-                    from: "nil",
-                    to: "Size",
-                    message: Some(format!(
-                        "Size value expects either an array with {0} values or {0} number values",
-                        N
-                    )),
-                })
+impl<'lua, const N: usize> FromArgPack<'lua> for LuaSize<N> {
+    fn convert(args: &mut ArgumentContext<'lua>, _: &'lua Lua) -> LuaResult<Self> {
+        const FIRST_ERR: &str = "value must be an array of coordinates or number";
+        if let Ok(table) = args.pop_typed_or(Some(FIRST_ERR)) {
+            let value = TryFrom::<LuaTable<'lua>>::try_from(table)?;
+            Ok(value)
+        } else {
+            let it = args.pop_typed_or(Some(FIRST_ERR))?;
+            let mut value = [it; N];
+            for i in 1..N {
+                value[i] =
+                    args.pop_typed_or(Some(format!("Point expected {i}-th number component")))?;
             }
-        };
-
-        #[inline(always)]
-        fn missing_argument<const N: usize>() -> LuaError {
-            LuaError::FromLuaConversionError {
-                from: "...",
-                to: "Size",
-                message: Some(format!(
-                    "Size requires {} ({}) arguments",
-                    N,
-                    COORD_NAME[0..N].join(", ")
-                )),
-            }
-        }
-
-        #[inline(always)]
-        fn invalid_argument_type(from: &'static str) -> LuaError {
-            LuaError::FromLuaConversionError {
-                from,
-                to: "f32",
-                message: Some("Size arguments must be numbers".to_string()),
-            }
-        }
-
-        #[inline]
-        fn read_coord<const N: usize>(it: Option<LuaValue>) -> Result<f32, LuaError> {
-            let it = it.ok_or_else(missing_argument::<N>)?;
-            match it {
-                LuaValue::Integer(it) => Ok(it as f32),
-                LuaValue::Number(it) => Ok(it as f32),
-                other => return Err(invalid_argument_type(other.type_name())),
-            }
-        }
-
-        match first {
-            LuaValue::Table(table) => {
-                let result = Self::try_from(table)?;
-                Ok(result)
-            }
-            LuaValue::Number(x) => {
-                let mut value = [x as f32; N];
-                for i in 1..N {
-                    value[i] = read_coord::<N>(values.pop_front())?;
-                }
-                Ok(LuaSize { value })
-            }
-            LuaValue::Integer(x) => {
-                let mut value = [x as f32; N];
-                for i in 1..N {
-                    value[i] = read_coord::<N>(values.pop_front())?;
-                }
-                Ok(LuaSize { value })
-            }
-            other => {
-                log::debug!("{:?}", other);
-                Err(LuaError::FromLuaConversionError {
-                    from: other.type_name(),
-                    to: "Size",
-                    message: Some(format!(
-                        "Size value expects either an array with {0} values or {0} number values",
-                        N
-                    )),
-                })
-            }
+            Ok(LuaSize { value })
         }
     }
 }
 
-impl<'lua, const N: usize> ToLua<'lua> for LuaSize<N> {
-    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+impl<'lua, const N: usize> IntoLua<'lua> for LuaSize<N> {
+    fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
         let result = lua.create_table()?;
 
         for (i, coord) in COORD_NAME[0..N].iter().enumerate() {
@@ -493,7 +422,7 @@ pub struct LuaPoint<const N: usize = 2> {
     value: [f32; N],
 }
 
-const COORD_NAME: &[&'static str] = &["x", "y", "z", "w"];
+const COORD_NAME: &[&str] = &["x", "y", "z", "w"];
 
 impl<const N: usize> LuaPoint<N> {
     #[inline(always)]
@@ -571,99 +500,20 @@ impl Into<Point3> for LuaPoint<3> {
     }
 }
 
-impl<'lua, const N: usize> FromLuaMulti<'lua> for LuaPoint<N> {
-    fn from_lua_multi(
-        values: &mut LuaMultiValue<'lua>,
-        _: LuaContext<'lua>,
-    ) -> LuaResult<Self> {
-        if values.is_empty() {
-            return Err(LuaError::FromLuaConversionError {
-                from: "...",
-                to: "Point",
-                message: Some(format!(
-                    "Point value expects either an array with {0} values or {0} number values",
-                    N
-                )),
-            });
-        }
-
-        let first = match values.pop_front() {
-            Some(it) => it,
-            None => {
-                return Err(LuaError::FromLuaConversionError {
-                    from: "nil",
-                    to: "Point",
-                    message: Some(format!(
-                        "Point value expects either an array with {0} values or {0} number values",
-                        N
-                    )),
-                })
+impl<'lua, const N: usize> FromArgPack<'lua> for LuaPoint<N> {
+    fn convert(args: &mut ArgumentContext<'lua>, _: &'lua Lua) -> LuaResult<Self> {
+        const FIRST_ERR: &str = "value must be an array of coordinates or number";
+        if let Ok(table) = args.pop_typed_or(Some(FIRST_ERR)) {
+            let value = TryFrom::<LuaTable<'lua>>::try_from(table)?;
+            Ok(value)
+        } else {
+            let it = args.pop_typed_or(Some(FIRST_ERR))?;
+            let mut value = [it; N];
+            for i in 1..N {
+                value[i] =
+                    args.pop_typed_or(Some(format!("Point expected {i}-th number component")))?;
             }
-        };
-
-        #[inline(always)]
-        fn missing_argument<const N: usize>() -> LuaError {
-            LuaError::FromLuaConversionError {
-                from: "...",
-                to: "Point",
-                message: Some(format!(
-                    "Point requires {} ({}) arguments",
-                    N,
-                    COORD_NAME[0..N].join(", ")
-                )),
-            }
-        }
-
-        #[inline(always)]
-        fn invalid_argument_type(from: &'static str) -> LuaError {
-            LuaError::FromLuaConversionError {
-                from,
-                to: "f32",
-                message: Some("Point arguments must be numbers".to_string()),
-            }
-        }
-
-        // TODO: repeated
-        #[inline]
-        fn read_coord<const N: usize>(it: Option<LuaValue>) -> Result<f32, LuaError> {
-            let it = it.ok_or_else(missing_argument::<N>)?;
-            match it {
-                LuaValue::Integer(it) => Ok(it as f32),
-                LuaValue::Number(it) => Ok(it as f32),
-                other => return Err(invalid_argument_type(other.type_name())),
-            }
-        }
-
-        match first {
-            LuaValue::Table(table) => {
-                let result = Self::try_from(table)?;
-                Ok(result)
-            }
-            LuaValue::Number(x) => {
-                let mut value = [x as f32; N];
-                for i in 1..N {
-                    value[i] = read_coord::<N>(values.pop_front())?;
-                }
-                Ok(LuaPoint { value })
-            }
-            LuaValue::Integer(x) => {
-                let mut value = [x as f32; N];
-                for i in 1..N {
-                    value[i] = read_coord::<N>(values.pop_front())?;
-                }
-                Ok(LuaPoint { value })
-            }
-            other => {
-                log::debug!("{:?}", other);
-                Err(LuaError::FromLuaConversionError {
-                    from: other.type_name(),
-                    to: "Point",
-                    message: Some(format!(
-                        "Point value expects either an array with {0} values or {0} number values",
-                        N
-                    )),
-                })
-            }
+            Ok(LuaPoint { value })
         }
     }
 }
@@ -716,15 +566,15 @@ impl<'lua, const N: usize> TryFrom<LuaTable<'lua>> for LuaPoint<N> {
     }
 }
 
-impl<'lua, const N: usize> ToLua<'lua> for LuaPoint<N> {
-    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+impl<'lua, const N: usize> IntoLua<'lua> for LuaPoint<N> {
+    fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
         let result = lua.create_table()?;
 
         for (i, coord) in COORD_NAME[0..N].iter().enumerate() {
             result.set(*coord, self.value[i])?;
         }
 
-        result.to_lua(lua)
+        result.into_lua(lua)
     }
 }
 
@@ -734,14 +584,14 @@ pub struct LuaLine<const N: usize = 2> {
     pub to: LuaPoint<N>,
 }
 
-impl<'lua, const N: usize> ToLua<'lua> for LuaLine<N> {
-    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+impl<'lua, const N: usize> IntoLua<'lua> for LuaLine<N> {
+    fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
         let result = lua.create_table()?;
 
-        result.set("from", self.from.to_lua(lua)?)?;
-        result.set("to", self.to.to_lua(lua)?)?;
+        result.set("from", self.from.into_lua(lua)?)?;
+        result.set("to", self.to.into_lua(lua)?)?;
 
-        result.to_lua(lua)
+        result.into_lua(lua)
     }
 }
 
@@ -761,92 +611,55 @@ pub struct SidePack {
     pub bottom: f32,
 }
 
-impl<'lua> FromLuaMulti<'lua> for SidePack {
-    fn from_lua_multi(
-        values: &mut LuaMultiValue<'lua>,
-        _: LuaContext<'lua>,
-    ) -> LuaResult<Self> {
-        #[inline(always)]
-        fn bad_argument_count() -> LuaError {
-            LuaError::FromLuaConversionError {
-                from: "...",
-                to: "Side",
-                message: Some("Side requires 2 (vertical, horizontal), 4 (left, top, right, bottom) arguments, or a table with those values".to_string()),
-            }
+impl<'lua> FromArgPack<'lua> for SidePack {
+    fn convert(args: &mut ArgumentContext<'lua>, _: &'lua Lua) -> LuaResult<Self> {
+        args.assert_next_type(&[LuaType::Integer, LuaType::Number, LuaType::Table])?;
+
+        if let Some(table) = args.pop_typed() {
+            return TryFrom::<LuaTable<'lua>>::try_from(table);
         }
 
-        let first = values.pop_front().ok_or_else(|| LuaError::CallbackError {
-            traceback: "expected a Side argument pack or table".to_string(),
-            cause: Arc::new(LuaError::FromLuaConversionError {
-                from: "nil",
-                to: "Side",
-                message: Some("Side parameters missing".to_string()),
-            }),
-        })?;
-
-        match first {
-            LuaValue::Table(table) => {
-                Self::try_from(table)
-            }
-            LuaValue::Integer(_) | LuaValue::Number(_) => {
-                let mut numbers = Vec::with_capacity(4);
-                numbers.push(match first {
-                    LuaValue::Integer(it) => it as f32,
-                    LuaValue::Number(it) => it as f32,
-                    _ => unreachable!(),
-                });
-                numbers.extend(
-                    values
-                        .peek_front_n(3)
-                        .map(|it| match it {
-                            LuaValue::Integer(it) => Some(*it as f32),
-                            LuaValue::Number(it) => Some(*it as f32),
-                            _ => None,
-                        })
-                        .take_while(Option::is_some)
-                        .filter_map(|it| it),
-                );
-
-                match numbers.len() {
-                    1 => unsafe {
-                        // SAFETY: numbers length checked by outer match
-                        let all = *numbers.get(0).unwrap_unchecked();
-                        Ok(SidePack {
-                            left: all,
-                            top: all,
-                            right: all,
-                            bottom: all,
-                        })
-                    },
-                    2 | 3 => unsafe {
-                        // SAFETY: numbers length checked by outer match
-                        let vertical = *numbers.get(0).unwrap_unchecked();
-                        let horizontal = *numbers.get(1).unwrap_unchecked();
-                        let _ = values.pop_front();
-                        Ok(SidePack {
-                            left: horizontal,
-                            top: vertical,
-                            right: horizontal,
-                            bottom: vertical,
-                        })
-                    },
-                    _ => unsafe {
-                        // SAFETY: numbers length checked by outer match
-                        let left = *numbers.get(0).unwrap_unchecked();
-                        let top = *numbers.get(1).unwrap_unchecked();
-                        let right = *numbers.get(2).unwrap_unchecked();
-                        let bottom = *numbers.get(3).unwrap_unchecked();
-                        values.pop_front_n(3).count();
-                        Ok(SidePack {
-                            left,
-                            top,
-                            right,
-                            bottom,
-                        })
-                    },
+        let single = args.pop_typed().unwrap();
+        let two = args.pop_typed().map(|it| [single, it]);
+        let four = match two {
+            Some([a, b]) => {
+                // take additional two or none
+                if let Some(c) = args.pop_typed() {
+                    match args.pop_typed() {
+                        Some(d) => Some([a, b, c, d]),
+                        None => {
+                            args.revert(c);
+                            None
+                        }
+                    }
+                } else {
+                    None
                 }
             }
-            _ => Err(bad_argument_count()),
+            None => None,
+        };
+
+        if let Some([left, top, right, bottom]) = four {
+            Ok(SidePack {
+                left,
+                top,
+                right,
+                bottom,
+            })
+        } else if let Some([vertical, horizontal]) = two {
+            Ok(SidePack {
+                left: horizontal,
+                top: vertical,
+                right: horizontal,
+                bottom: vertical,
+            })
+        } else {
+            Ok(SidePack {
+                left: single,
+                top: single,
+                right: single,
+                bottom: single,
+            })
         }
     }
 }
@@ -918,7 +731,7 @@ impl<'lua> TryFrom<LuaTable<'lua>> for SidePack {
                     bottom: all,
                 })
             },
-            2 => unsafe {
+            2 | 3 => unsafe {
                 // SAFETY: Length of values is checked by outer match
                 let v = values.pop_front().unwrap_unchecked().map_err(|inner| {
                     LuaError::CallbackError {

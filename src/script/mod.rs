@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::ClunkyError;
-use rlua::prelude::*;
+use mlua::prelude::*;
 use settings::Settings;
 
 pub mod data;
@@ -22,34 +22,31 @@ impl ScriptContext {
         let init_script =
             std::fs::read_to_string(path.as_ref()).expect("unable to read init script");
 
-        let lua = Lua::new();
+        let lua = Lua::new_with(LuaStdLib::ALL_SAFE, LuaOptions::new())
+            .expect("unable to construct Lua context");
 
-        lua.context::<_, Result<(), ClunkyError>>(|lua_ctx| {
-            let g = lua_ctx.globals();
+        let g = lua.globals();
 
-            if let Some(file_name) = path.as_ref().to_str() {
-                g.set("_name", file_name)?;
-                g.set("_logger_name", file_name)?;
+        if let Some(file_name) = path.as_ref().to_str() {
+            g.set("_name", file_name)?;
+            g.set("_logger_name", file_name)?;
+        }
+        if let Some(parent) = canonical_path.parent() {
+            if let Some(parent) = parent.to_str() {
+                g.set("_dir", parent)?;
+            } else {
+                log::warn!(
+                    "unable to determine script parent directory, '_dir' will not be defined"
+                )
             }
-            if let Some(parent) = canonical_path.parent() {
-                if let Some(parent) = parent.to_str() {
-                    g.set("_dir", parent)?;
-                } else {
-                    log::warn!(
-                        "unable to determine script parent directory, '_dir' will not be defined"
-                    )
-                }
-            }
+        }
+        drop(g);
 
-            crate::render::frontend::bindings::setup(lua_ctx)?;
+        crate::render::frontend::bindings::setup(&lua)?;
 
-            lua_ctx
-                .load(&init_script)
-                .set_name(path.as_ref().to_str().unwrap_or("user script"))
-                .expect("invalid user script")
-                .exec()?;
-            Ok(())
-        })?;
+        lua.load(&init_script)
+            .set_name(path.as_ref().to_str().unwrap_or("user script"))
+            .exec()?;
 
         Ok(ScriptContext {
             source: path.as_ref().to_path_buf(),
@@ -58,12 +55,11 @@ impl ScriptContext {
     }
 
     pub fn load_settings(&self) -> Settings {
-        let load_result = self.lua.context(|lua_ctx| {
-            lua_ctx
-                .globals()
-                .get("settings")
-                .and_then(|it| Settings::load(lua_ctx, it))
-        });
+        let load_result = self
+            .lua
+            .globals()
+            .get("settings")
+            .and_then(|it| Settings::load(&self.lua, it));
 
         match load_result {
             Ok(it) => it,
@@ -80,13 +76,11 @@ impl ScriptContext {
 
 impl Drop for ScriptContext {
     fn drop(&mut self) {
-        self.lua.context(|ctx| {
-            ctx.expire_registry_values();
-        })
+        self.lua.expire_registry_values();
     }
 }
 
-pub fn lua_is_eq<'lua, A: ToLua<'lua>, B: ToLua<'lua>>(ctx: &LuaContext<'lua>, a: A, b: B) -> bool {
+pub fn lua_is_eq<'lua, A: IntoLua<'lua>, B: IntoLua<'lua>>(ctx: &'lua Lua, a: A, b: B) -> bool {
     // TODO: Remove when https://github.com/amethyst/rlua/issues/112 is resolved
     let check: LuaFunction<'lua> = ctx
         .load("function(a, b) return a == b end")
@@ -94,5 +88,3 @@ pub fn lua_is_eq<'lua, A: ToLua<'lua>, B: ToLua<'lua>>(ctx: &LuaContext<'lua>, a
         .expect("invalid check expression");
     check.call((a, b)).unwrap_or_default()
 }
-
-pub use rlua_skia::ext::rlua as ext;

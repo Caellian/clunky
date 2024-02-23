@@ -4,8 +4,8 @@ use std::mem::align_of;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mlua::UserData;
 use parking_lot::Mutex;
-use rlua::UserData;
 
 use super::data::CollectorCallback;
 
@@ -136,7 +136,7 @@ impl Status {
 }
 
 impl UserData for Status {
-    fn add_methods<'lua, T: rlua::prelude::LuaUserDataMethods<'lua, Self>>(methods: &mut T) {
+    fn add_methods<'lua, T: mlua::UserDataMethods<'lua, Self>>(methods: &mut T) {
         methods.add_method_mut("requestUpdate", |_, this, millis: u64| {
             let mut inner = this.inner.lock();
             inner.next_update = Some(Instant::now() + Duration::from_millis(millis));

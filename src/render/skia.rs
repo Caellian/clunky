@@ -3,11 +3,11 @@ use skia_safe::{surfaces, Borrows, ColorSpace, ColorType, ImageInfo, Surface};
 use super::buffer::FrameBuffer;
 
 pub trait FrameBufferSurface {
-    fn to_surface<'a>(&'a mut self) -> Borrows<'a, Surface>;
+    fn to_surface(&mut self) -> Borrows<'_, Surface>;
 }
 
 impl FrameBufferSurface for FrameBuffer {
-    fn to_surface<'a>(&'a mut self) -> Borrows<'a, Surface> {
+    fn to_surface(&mut self) -> Borrows<'_, Surface> {
         let size = self.frame_parameters().dimensions;
 
         let info =
@@ -18,5 +18,4 @@ impl FrameBufferSurface for FrameBuffer {
     }
 }
 
-pub use rlua_skia as bindings;
-pub use rlua_skia::ext::skia as ext;
+pub use mlua_skia as bindings;

@@ -1,9 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use drain_filter_polyfill::VecExt;
-use rlua::prelude::{
-    LuaContext, LuaError, LuaRegistryKey as RegistryKey, LuaResult, LuaTable, LuaValue,
-};
+use mlua::prelude::{Lua, LuaError, LuaRegistryKey as RegistryKey, LuaResult, LuaTable, LuaValue};
 
 use crate::script::events::Consumer;
 
@@ -13,7 +11,7 @@ use super::events::{EventData, Status};
 pub struct CollectorCallback(Arc<RegistryKey>);
 
 impl CollectorCallback {
-    pub fn value<'lua>(&self, ctx: &LuaContext<'lua>) -> LuaValue<'lua> {
+    pub fn value<'lua>(&self, ctx: &'lua Lua) -> LuaValue<'lua> {
         ctx.registry_value(self.0.as_ref())
             .expect("callback destroyed while running")
     }
@@ -42,10 +40,7 @@ impl DataCollectors {
         }
     }
 
-    pub fn new_lua_collectors<'lua>(
-        lua: LuaContext<'lua>,
-        list: LuaTable<'lua>,
-    ) -> LuaResult<Self> {
+    pub fn new_lua_collectors<'lua>(lua: &'lua Lua, list: LuaTable<'lua>) -> LuaResult<Self> {
         let mut result = Self::new();
         let collectors = &mut result.collectors;
 
@@ -69,7 +64,7 @@ impl DataCollectors {
 
     pub fn update_state<'lua>(
         &mut self,
-        ctx: LuaContext<'lua>,
+        ctx: &'lua Lua,
         scheduled: Option<&mut Vec<EventData>>,
     ) -> LuaResult<(RegistryKey, Vec<EventData>)> {
         let table = ctx.create_table()?;
@@ -82,7 +77,7 @@ impl DataCollectors {
         }
 
         fn run_callback<'lua>(
-            ctx: LuaContext<'lua>,
+            ctx: &'lua Lua,
             name: &str,
             cb: &CollectorCallback,
         ) -> Option<(Status, LuaValue<'lua>)> {
@@ -104,7 +99,7 @@ impl DataCollectors {
         }
 
         fn handle_callback<'lua>(
-            ctx: LuaContext<'lua>,
+            ctx: &'lua Lua,
             results: &LuaTable<'lua>,
             state: &mut CollectorState,
             name: &str,

@@ -1,4 +1,4 @@
-font_tf = Typeface:MakeFromName("Courier New")
+font_tf = Typeface:makeFromName("Courier New")
 font = Font(font_tf)
 
 primary = {

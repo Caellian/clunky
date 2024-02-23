@@ -9,13 +9,12 @@ use std::{
 use args::Arguments;
 use clap::Parser;
 use env_logger::Env;
-use error::ClunkyError;
 use glam::{IVec2, UVec2};
+use mlua::prelude::*;
 use render::{
     frontend::{bindings::LuaCanvas, FrameBufferSurface},
     RenderTarget, RenderTargetImpl, TargetConfig,
 };
-use rlua::prelude::*;
 use script::{events::EventBuffer, settings::Settings};
 use skia_safe::{Color, Color4f};
 
@@ -48,9 +47,8 @@ fn main() {
     let (mut evb, state) = {
         let mut evb = EventBuffer::new();
 
-        let (state, scheduled) = script
-            .lua()
-            .context(|ctx| collectors.update_state(ctx, None))
+        let (state, scheduled) = collectors
+            .update_state(script.lua(), None)
             .expect("unable to initialize state table");
 
         evb.schedule(scheduled);
@@ -81,9 +79,8 @@ fn main() {
         queue.blocking_dispatch(&mut target).unwrap();
         let mut scheduled = evb.take_scheduled();
 
-        let (state, scheduled) = script
-            .lua()
-            .context(|ctx| collectors.update_state(ctx, Some(&mut scheduled)))
+        let (state, scheduled) = collectors
+            .update_state(script.lua(), Some(&mut scheduled))
             .expect("can't update state");
         evb.schedule(scheduled);
 
@@ -103,40 +100,43 @@ fn draw_frame<Q, T: RenderTarget<Q>>(
     state: LuaRegistryKey,
 ) {
     if let Some(draw_cb) = &settings.draw {
-        let result = script.lua().context(|lua| {
-            let render_fn: LuaFunction = lua.registry_value(draw_cb)?;
+        let render_fn: LuaFunction = match script.lua().registry_value(draw_cb) {
+            Ok(it) => it,
+            Err(err) => {
+                print_stack_trace(&err);
+                exit(1);
+            }
+        };
 
-            let mut surface = target.buffer().to_surface();
-            let canvas = surface.canvas();
-            canvas.clear(Color4f::from(Color::TRANSPARENT));
-            let canvas = unsafe {
-                // SAFETY: calling render_fn will block the current thread
-                // until Lua function is done executing. During that time,
-                // `target` reference won't be dropped so canvas will stay
-                // valid.
-                // render_fn.call takes ownership of `surface` and through
-                // that also the refence to `target`. Passing actual
-                // references isn't supported so canvas lifetime has
-                // to be erased for temporary LuaCanvas wrapper.
-                LuaCanvas::Borrowed(addr_of!(*surface.canvas()).as_ref().unwrap_unchecked())
-            };
+        let mut surface = target.buffer().to_surface();
+        let canvas = surface.canvas();
+        canvas.clear(Color4f::from(Color::TRANSPARENT));
+        let canvas = unsafe {
+            // SAFETY: calling render_fn will block the current thread
+            // until Lua function is done executing. During that time,
+            // `target` reference won't be dropped so canvas will stay
+            // valid.
+            // render_fn.call takes ownership of `surface` and through
+            // that also the refence to `target`. Passing actual
+            // references isn't supported so canvas lifetime has
+            // to be erased for temporary LuaCanvas wrapper.
+            LuaCanvas::Borrowed(addr_of!(*surface.canvas()).as_ref().unwrap_unchecked())
+        };
 
-            let state_value: LuaTable = lua
-                .registry_value(&state)
-                .expect("expired state in registry");
+        let state_value: LuaTable = script
+            .lua()
+            .registry_value(&state)
+            .expect("expired state in registry");
 
-            render_fn
-                .call((canvas, state_value))
-                .map_err(crate::error::ClunkyError::Lua)?;
-
-            let _ = lua.remove_registry_value(state);
-            Ok::<_, ClunkyError>(())
-        });
-
-        if let Err(err) = result {
+        if let Err(err) = render_fn
+            .call::<(LuaCanvas, LuaTable), ()>((canvas, state_value))
+            .map_err(crate::error::ClunkyError::Lua)
+        {
             print_stack_trace(&err);
             exit(1);
         }
+
+        let _ = script.lua().remove_registry_value(state);
 
         target.push_frame(qh);
     }

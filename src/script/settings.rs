@@ -1,4 +1,4 @@
-use rlua::{Context, Function, RegistryKey, Result as LuaResult, Table};
+use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table};
 
 use super::data::DataCollectors;
 
@@ -30,7 +30,7 @@ impl Default for Settings {
 }
 
 impl Settings {
-    pub fn load<'lua>(ctx: Context<'lua>, table: Table<'lua>) -> LuaResult<Self> {
+    pub fn load<'lua>(ctx: &'lua Lua, table: Table<'lua>) -> LuaResult<Self> {
         let mut result = Settings::default();
 
         if let Ok(framerate) = table.get("framerate") {

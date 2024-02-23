@@ -1,10 +1,12 @@
 [package]
-name = "rlua-skia"
+name = "mlua-skia"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rlua = { path = "../vendored/rlua" }
+mlua-skia-macros = { path = "./macros" }
+
+mlua = "0.9"
 skia-safe = { git = "https://github.com/rust-skia/rust-skia.git", rev = "03ef1ef138b5870c26b8c38d8c356d90cbecde39" }
 skia-bindings = { git = "https://github.com/rust-skia/rust-skia.git", rev = "03ef1ef138b5870c26b8c38d8c356d90cbecde39" }
 

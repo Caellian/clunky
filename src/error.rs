@@ -5,7 +5,7 @@ use std::{
 
 use thiserror::Error;
 
-pub type LuaError = rlua::Error;
+pub type LuaError = mlua::Error;
 
 #[derive(Clone, Debug)]
 pub struct Detail(pub Option<String>);
@@ -90,16 +90,16 @@ pub enum ClunkyError {
     #[error(transparent)]
     Render(#[from] RenderError),
     #[error(transparent)]
-    Lua(#[from] rlua::Error),
+    Lua(#[from] mlua::Error),
     #[error(transparent)]
     IO(#[from] std::io::Error),
 }
 
-impl Into<rlua::Error> for ClunkyError {
-    fn into(self) -> rlua::Error {
+impl Into<mlua::Error> for ClunkyError {
+    fn into(self) -> mlua::Error {
         match self {
             ClunkyError::Lua(err) => err,
-            other => rlua::Error::ExternalError(Arc::new(other)),
+            other => mlua::Error::ExternalError(Arc::new(other)),
         }
     }
 }

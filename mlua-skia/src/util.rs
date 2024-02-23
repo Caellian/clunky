@@ -48,3 +48,14 @@ pub fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (f32, f32, f32) 
         hue2rgb(p, q, hue - 1. / 3.),
     )
 }
+
+pub trait OptionStrOwned {
+    fn cloned(self) -> Option<String>;
+}
+
+impl OptionStrOwned for Option<&str> {
+    #[inline(always)]
+    fn cloned(self) -> Option<String> {
+        self.map(|it| it.to_string())
+    }
+}

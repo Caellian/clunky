@@ -1,10 +1,8 @@
 use std::str::FromStr;
 use std::sync::OnceLock;
 
+use mlua::prelude::*;
 use phf::phf_map;
-use rlua::prelude::*;
-
-use crate::wrap::*;
 
 use skia_safe::{
     canvas::SaveLayerFlags,
@@ -20,6 +18,8 @@ use skia_safe::{
     trim_path_effect::Mode as TrimMode,
     *,
 };
+
+use crate::{FromArgPack, WrapperT};
 
 macro_rules! named_enum {
     ($kind: ty: [$($value: expr => $name: literal,)+]) => {paste::paste!{
@@ -46,7 +46,7 @@ macro_rules! named_enum {
             }
         }
 
-        impl<'lua> WrapperT<'lua> for [<Lua $kind>] {
+        impl<'lua> $crate::lua::WrapperT<'lua> for [<Lua $kind>] {
             type Wrapped = $kind;
 
             #[inline]
@@ -116,7 +116,7 @@ macro_rules! named_enum {
         }
 
         impl<'lua> FromLua<'lua> for [<Lua $kind>] {
-            fn from_lua(text: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
+            fn from_lua(text: LuaValue<'lua>, _: &'lua Lua) -> LuaResult<Self> {
                 let text = match text {
                     LuaValue::String(it) => it,
                     other => {
@@ -134,10 +134,11 @@ macro_rules! named_enum {
                 Self::try_from(text)
             }
         }
+        $crate::from_lua_argpack!([<Lua $kind>]);
 
-        impl<'lua> ToLua<'lua> for [<Lua $kind>] {
+        impl<'lua> IntoLua<'lua> for [<Lua $kind>] {
             #[allow(unreachable_patterns)]
-            fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+            fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
                 lua.create_string(match self.0 {
                     $($value => $name,)
                     +
@@ -479,9 +480,9 @@ impl<'lua> TryFrom<LuaString<'lua>> for LuaInPremul {
         Self::from_str(value.to_str()?)
     }
 }
-impl<'lua> FromLua<'lua> for LuaInPremul {
-    fn from_lua(text: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
-        let text = match text {
+impl<'lua> FromArgPack<'lua> for LuaInPremul {
+    fn convert(args: &mut crate::ArgumentContext<'lua>, _: &'lua Lua) -> LuaResult<Self> {
+        let text = match args.pop() {
             LuaValue::String(it) => it,
             LuaValue::Boolean(value) => {
                 return Ok(match value {
@@ -503,9 +504,9 @@ impl<'lua> FromLua<'lua> for LuaInPremul {
         Self::try_from(text)
     }
 }
-impl<'lua> ToLua<'lua> for LuaInPremul {
+impl<'lua> IntoLua<'lua> for LuaInPremul {
     #[allow(unreachable_patterns)]
-    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+    fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
         lua.create_string(match self.0 {
             InPremul::Yes => "yes",
             InPremul::No => "no",
@@ -538,7 +539,7 @@ macro_rules! named_bitflags {
                 Ok(Self(result))
             }
 
-            pub fn to_table<'lua>(&self, ctx: LuaContext<'lua>) -> Result<LuaTable<'lua>, LuaError> {
+            pub fn to_table<'lua>(&self, ctx: &'lua Lua) -> Result<LuaTable<'lua>, LuaError> {
                 let result = ctx.create_table()?;
                 let mut i: usize = 0;
                 for entry in [$($value),+] {
@@ -666,9 +667,9 @@ impl<'lua> TryFrom<LuaString<'lua>> for LuaPaintStyle {
         Self::from_str(value.to_str()?)
     }
 }
-impl<'lua> FromLua<'lua> for LuaPaintStyle {
-    fn from_lua(text: LuaValue<'lua>, _: LuaContext<'lua>) -> LuaResult<Self> {
-        let text = match text {
+impl<'lua> FromArgPack<'lua> for LuaPaintStyle {
+    fn convert(args: &mut crate::ArgumentContext<'lua>, _: &'lua Lua) -> LuaResult<Self> {
+        let text = match args.pop() {
             LuaValue::String(it) => it,
             LuaValue::Table(list) => {
                 let count = list.clone().sequence_values::<String>().count();
@@ -716,9 +717,9 @@ impl<'lua> FromLua<'lua> for LuaPaintStyle {
     }
 }
 
-impl<'lua> ToLua<'lua> for LuaPaintStyle {
+impl<'lua> IntoLua<'lua> for LuaPaintStyle {
     #[allow(unreachable_patterns)]
-    fn to_lua(self, lua: LuaContext<'lua>) -> LuaResult<LuaValue<'lua>> {
+    fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
         lua.create_string(match self.0 {
             PaintStyle::Fill => "fill",
             PaintStyle::Stroke => "stroke",
