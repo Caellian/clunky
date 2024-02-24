@@ -123,10 +123,10 @@ impl From<Color4f> for LuaColor {
     }
 }
 
-impl Into<Color4f> for LuaColor {
+impl From<LuaColor> for Color4f {
     #[inline]
-    fn into(self) -> Color4f {
-        Color4f::new(self.r, self.g, self.b, self.a)
+    fn from(val: LuaColor) -> Self {
+        Color4f::new(val.r, val.g, val.b, val.a)
     }
 }
 
@@ -143,10 +143,10 @@ impl From<Color> for LuaColor {
     }
 }
 
-impl Into<Color> for LuaColor {
+impl From<LuaColor> for Color {
     #[inline]
-    fn into(self) -> Color {
-        Into::<Color4f>::into(self).to_color()
+    fn from(val: LuaColor) -> Self {
+        Into::<Color4f>::into(val).to_color()
     }
 }
 
@@ -264,9 +264,9 @@ impl From<Rect> for LuaRect {
         }
     }
 }
-impl Into<Rect> for LuaRect {
-    fn into(self) -> Rect {
-        Rect::new(self.from.x(), self.from.y(), self.to.x(), self.to.y())
+impl From<LuaRect> for Rect {
+    fn from(val: LuaRect) -> Self {
+        Rect::new(val.from.x(), val.from.y(), val.to.x(), val.to.y())
     }
 }
 impl From<IRect> for LuaRect {
@@ -281,13 +281,13 @@ impl From<IRect> for LuaRect {
         }
     }
 }
-impl Into<IRect> for LuaRect {
-    fn into(self) -> IRect {
+impl From<LuaRect> for IRect {
+    fn from(val: LuaRect) -> Self {
         IRect::new(
-            self.from.x() as i32,
-            self.from.y() as i32,
-            self.to.x() as i32,
-            self.to.y() as i32,
+            val.from.x() as i32,
+            val.from.y() as i32,
+            val.to.x() as i32,
+            val.to.y() as i32,
         )
     }
 }
@@ -322,11 +322,11 @@ impl From<ISize> for LuaSize {
         }
     }
 }
-impl Into<ISize> for LuaSize {
-    fn into(self) -> ISize {
+impl From<LuaSize> for ISize {
+    fn from(val: LuaSize) -> Self {
         ISize {
-            width: self.width() as i32,
-            height: self.height() as i32,
+            width: val.width() as i32,
+            height: val.height() as i32,
         }
     }
 }
@@ -339,8 +339,8 @@ impl<'lua, const N: usize> FromArgPack<'lua> for LuaSize<N> {
         } else {
             let it = args.pop_typed_or(Some(FIRST_ERR))?;
             let mut value = [it; N];
-            for i in 1..N {
-                value[i] =
+            for (i, value) in value.iter_mut().enumerate().skip(1) {
+                *value =
                     args.pop_typed_or(Some(format!("Point expected {i}-th number component")))?;
             }
             Ok(LuaSize { value })
@@ -458,11 +458,11 @@ impl From<Point> for LuaPoint {
         }
     }
 }
-impl Into<Point> for LuaPoint {
-    fn into(self) -> Point {
+impl From<LuaPoint> for Point {
+    fn from(val: LuaPoint) -> Self {
         Point {
-            x: self.x(),
-            y: self.y(),
+            x: val.x(),
+            y: val.y(),
         }
     }
 }
@@ -474,11 +474,11 @@ impl From<IPoint> for LuaPoint {
         }
     }
 }
-impl Into<IPoint> for LuaPoint {
-    fn into(self) -> IPoint {
+impl From<LuaPoint> for IPoint {
+    fn from(val: LuaPoint) -> Self {
         IPoint {
-            x: self.x() as i32,
-            y: self.y() as i32,
+            x: val.x() as i32,
+            y: val.y() as i32,
         }
     }
 }
@@ -490,12 +490,12 @@ impl From<Point3> for LuaPoint<3> {
         }
     }
 }
-impl Into<Point3> for LuaPoint<3> {
-    fn into(self) -> Point3 {
+impl From<LuaPoint<3>> for Point3 {
+    fn from(val: LuaPoint<3>) -> Self {
         Point3 {
-            x: self.x(),
-            y: self.y(),
-            z: self.z(),
+            x: val.x(),
+            y: val.y(),
+            z: val.z(),
         }
     }
 }
@@ -509,8 +509,8 @@ impl<'lua, const N: usize> FromArgPack<'lua> for LuaPoint<N> {
         } else {
             let it = args.pop_typed_or(Some(FIRST_ERR))?;
             let mut value = [it; N];
-            for i in 1..N {
-                value[i] =
+            for (i, value) in value.iter_mut().enumerate().skip(1) {
+                *value =
                     args.pop_typed_or(Some(format!("Point expected {i}-th number component")))?;
             }
             Ok(LuaPoint { value })

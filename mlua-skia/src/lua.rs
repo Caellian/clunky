@@ -115,7 +115,7 @@ impl Display for LuaType {
 pub type ArgumentNames = Option<&'static [&'static str]>;
 
 #[derive(Debug)]
-pub struct ArgumentContext<'lua> {
+pub(crate) struct ArgumentContext<'lua> {
     value: Vec<Value<'lua>>,
     argument_names: ArgumentNames,
     initial_count: usize,
@@ -180,7 +180,7 @@ impl<'lua> ArgumentContext<'lua> {
         }
 
         let mut expected = String::with_capacity(one_of.len() * 6);
-        for (i, ty) in one_of.into_iter().map(LuaType::name).enumerate() {
+        for (i, ty) in one_of.iter().map(LuaType::name).enumerate() {
             if i > 0 {
                 expected.push_str(", ");
             }
@@ -214,7 +214,7 @@ impl<'lua> ArgumentContext<'lua> {
 
     pub fn at_name(&self) -> Option<&'static str> {
         self.argument_names
-            .and_then(|it| it.get(self.logical_argument).map(|it| *it))
+            .and_then(|it| it.get(self.logical_argument).copied())
     }
 
     #[inline]
@@ -280,10 +280,10 @@ impl<'lua> ArgumentContext<'lua> {
     }
 }
 
-impl<'lua> Into<MultiValue<'lua>> for ArgumentContext<'lua> {
-    fn into(mut self) -> MultiValue<'lua> {
-        self.value.reverse();
-        MultiValue::from_vec(self.value)
+impl<'lua> From<ArgumentContext<'lua>> for MultiValue<'lua> {
+    fn from(mut val: ArgumentContext<'lua>) -> Self {
+        val.value.reverse();
+        MultiValue::from_vec(val.value)
     }
 }
 
@@ -379,84 +379,84 @@ impl<'lua> IsValue<'lua> for LightUserData {
     }
 }
 macro_rules! int_is_val {
-        ($($int: ty),+) => {
-            $(impl<'lua> IsValue<'lua> for $int {
-                const TYPE: LuaType = LuaType::Integer;
+    ($($int: ty),+) => {
+        $(impl<'lua> IsValue<'lua> for $int {
+            const TYPE: LuaType = LuaType::Integer;
 
-                #[inline(always)]
-                fn into_value(self) -> Value<'lua> {
-                    Value::Integer(self as i64)
+            #[inline(always)]
+            fn into_value(self) -> Value<'lua> {
+                Value::Integer(self as i64)
+            }
+            fn from_value(wrapped: Value<'lua>) -> Result<Self, (ConversionError, Value<'lua>)> {
+                if let Value::Integer(it) = wrapped {
+                    Ok(it as $int)
+                } else if let Value::Number(it) = wrapped {
+                    Ok(it as $int)
+                } else {
+                    Err((ConversionError {
+                        from: wrapped.type_name(),
+                        to: stringify!($int),
+                    }, wrapped))
                 }
-                fn from_value(wrapped: Value<'lua>) -> Result<Self, (ConversionError, Value<'lua>)> {
-                    if let Value::Integer(it) = wrapped {
-                        Ok(it as $int)
-                    } else if let Value::Number(it) = wrapped {
-                        Ok(it as $int)
-                    } else {
-                        Err((ConversionError {
-                            from: wrapped.type_name(),
-                            to: stringify!($int),
-                        }, wrapped))
-                    }
-                }
-            })+
-        };
-    }
+            }
+        })+
+    };
+}
 int_is_val![u8, u16, u32, u64, i8, i16, i32, i64];
 
 macro_rules! float_is_val {
-        ($($float: ty),+) => {
-            $(impl<'lua> IsValue<'lua> for $float {
-                const TYPE: LuaType = LuaType::Number;
+    ($($float: ty),+) => {
+        $(impl<'lua> IsValue<'lua> for $float {
+            const TYPE: LuaType = LuaType::Number;
 
-                #[inline(always)]
-                fn into_value(self) -> Value<'lua> {
-                    Value::Number(self as f64)
+            #[inline(always)]
+            fn into_value(self) -> Value<'lua> {
+                Value::Number(self as f64)
+            }
+            fn from_value(wrapped: Value<'lua>) -> Result<Self, (ConversionError, Value<'lua>)> {
+                if let Value::Number(it) = wrapped {
+                    Ok(it as $float)
+                } else if let Value::Integer(it) = wrapped {
+                    Ok(it as $float)
+                }  else {
+                    Err((ConversionError {
+                        from: wrapped.type_name(),
+                        to: stringify!($float),
+                    }, wrapped))
                 }
-                fn from_value(wrapped: Value<'lua>) -> Result<Self, (ConversionError, Value<'lua>)> {
-                    if let Value::Number(it) = wrapped {
-                        Ok(it as $float)
-                    } else if let Value::Integer(it) = wrapped {
-                        Ok(it as $float)
-                    }  else {
-                        Err((ConversionError {
-                            from: wrapped.type_name(),
-                            to: stringify!($float),
-                        }, wrapped))
-                    }
-                }
-            })+
-        };
-    }
+            }
+        })+
+    };
+}
 float_is_val![f32, f64];
 
 macro_rules! lifetimed_is_val {
-        ($($name: ident),+) => {
-            $(impl<'lua> IsValue<'lua> for mlua::$name<'lua> {
-                const TYPE: LuaType = LuaType::$name;
+    ($($name: ident),+) => {
+        $(impl<'lua> IsValue<'lua> for mlua::$name<'lua> {
+            const TYPE: LuaType = LuaType::$name;
 
-                #[inline(always)]
-                fn into_value(self) -> Value<'lua> {
-                    Value::$name(self)
+            #[inline(always)]
+            fn into_value(self) -> Value<'lua> {
+                Value::$name(self)
+            }
+            fn from_value(
+                wrapped: Value<'lua>,
+            ) -> Result<Self, (ConversionError, Value<'lua>)> {
+                if let Value::$name(it) = wrapped {
+                    Ok(it)
+                } else {
+                    Err((
+                        ConversionError {
+                            from: wrapped.type_name(),
+                            to: LuaType::$name.name(),
+                        },
+                        wrapped,
+                    ))
                 }
-                fn from_value(
-                    wrapped: Value<'lua>,
-                ) -> Result<Self, (ConversionError, Value<'lua>)> {
-                    if let Value::$name(it) = wrapped {
-                        Ok(it)
-                    } else {
-                        Err((
-                            ConversionError {
-                                from: wrapped.type_name(),
-                                to: LuaType::$name.name(),
-                            },
-                            wrapped,
-                        ))
-                    }
-                }
-            })+
-        };
-    }
+            }
+        })+
+    };
+}
 lifetimed_is_val!(Table, Function, Thread);
 
 impl<'lua> IsValue<'lua> for mlua::String<'lua> {
@@ -745,6 +745,7 @@ impl<'lua> ContextExt<'lua> for Lua {
 
 pub struct LuaArray<'lua>(Vec<Value<'lua>>);
 
+#[allow(dead_code)]
 impl<'lua> LuaArray<'lua> {
     pub fn len(&self) -> usize {
         self.0.len()
@@ -1088,8 +1089,6 @@ pub trait WrapperT<'lua> {
     fn unwrap(self) -> Self::Wrapped;
 }
 
-// TODO: Unify FromLua and FromArgPack for extensions.
-
 /// Applies TableExt to reading table values with wrapper types, automatically
 /// handling unwrapping.
 pub trait TableWrapperExt<'lua>: TableExt<'lua> {
@@ -1135,21 +1134,14 @@ macro_rules! wrap_skia_handle {
             #[derive(Clone)]
             pub struct [<Lua $handle>](pub $handle);
 
-            impl std::ops::Deref for [<Lua $handle>] {
-                type Target = $handle;
-
-                fn deref(&self) -> &Self::Target {
-                    &self.0
+            impl From<$handle> for [<Lua $handle>] {
+                fn from(value: $handle) -> [<Lua $handle>] {
+                    [<Lua $handle>](value)
                 }
             }
-            impl std::ops::DerefMut for [<Lua $handle>] {
-                fn deref_mut(&mut self) -> &mut Self::Target {
-                    &mut self.0
-                }
-            }
-            impl Into<$handle> for [<Lua $handle>] {
-                fn into(self) -> $handle {
-                    self.0
+            impl From<[<Lua $handle>]> for $handle {
+                fn from(value: [<Lua $handle>]) -> $handle {
+                    value.0
                 }
             }
             impl AsRef<$handle> for [<Lua $handle>] {
@@ -1177,26 +1169,9 @@ macro_rules! type_like {
             #[derive(Clone)]
             pub struct [<Like $handle>]([<Lua $handle>]);
 
-            impl Into<[<Lua $handle>]> for [<Like $handle>] {
-                fn into(self) -> [<Lua $handle>] {
-                    self.0
-                }
-            }
-            impl std::ops::Deref for [<Like $handle>] {
-                type Target = $handle;
-
-                fn deref(&self) -> &Self::Target {
-                    &self.0
-                }
-            }
-            impl std::ops::DerefMut for [<Like $handle>] {
-                fn deref_mut(&mut self) -> &mut Self::Target {
-                    &mut self.0
-                }
-            }
-            impl AsRef<$handle> for [<Like $handle>] {
-                fn as_ref(&self) -> &$handle {
-                    &self.0
+            impl From<[<Like $handle>]> for [<Lua $handle>] {
+                fn from(value: [<Like $handle>]) -> [<Lua $handle>] {
+                    value.0
                 }
             }
             impl<'lua> $crate::lua::WrapperT<'lua> for [<Like $handle>] {

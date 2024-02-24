@@ -15,8 +15,11 @@ pub fn lua_methods(
     let options = parse_macro_input!(options as AttributeOptions);
 
     let model: UserDataMetods = parse_macro_input!(input as UserDataMetods);
-    let mut result = match model.generate_userdata_impl(&options) {
-        Ok(it) => it.into_token_stream(),
+
+    let mut result = model.base_impl().into_token_stream();
+
+    match model.generate_userdata_impl(&options) {
+        Ok(it) => result.extend(it.into_token_stream()),
         Err(err) => return err.to_compile_error().into_token_stream().into(),
     };
 

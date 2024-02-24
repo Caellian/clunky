@@ -1,4 +1,3 @@
-use proc_macro::Punct;
 use proc_macro2::Span;
 use syn::{
     parse::{Parse, ParseStream},
@@ -9,7 +8,7 @@ use syn::{
 };
 
 use crate::{
-    options::{AttributeOptions, EntryOptions},
+    options::{AttributeOptions, ItemOptions},
     util::*,
 };
 
@@ -29,7 +28,7 @@ struct MethodSignature {
     is_meta: bool,
     kind: SignatureKind,
 
-    options: EntryOptions,
+    options: ItemOptions,
     lua_ctx: Option<(Lifetime, Ident)>,
     name: Ident,
     inputs: Punctuated<FnArg, Token![,]>,
@@ -72,9 +71,7 @@ impl MethodSignature {
     }
 }
 
-// Constructor
-// TODO: methods.add_meta_function(MetaMethod::Call, |_, ()| Ok(Rectangle::default()));
-// Gen rust impl code
+// TODO: Gen rust impl code
 static METAMETHODS: &[&str] = &[
     "__index",
     "__newindex",
@@ -103,6 +100,20 @@ const CTX_ERASED: &str = "__lua_ctx";
 const ARGS_MAPPED: &str = "__lua_cb_args";
 const REF_SUFFIX: &str = "_ud_ref";
 
+fn is_path_lua(path: &Path) -> bool {
+    if path.segments.iter().any(|it| !it.arguments.is_none()) {
+        return false;
+    }
+    let name = path
+        .segments
+        .iter()
+        .map(|it| it.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::");
+
+    matches!(name.as_str(), "mlua::Lua" | "Lua" | "LuaContext")
+}
+
 fn lua_ctx_name(arg: &FnArg) -> Option<(Lifetime, Ident)> {
     let arg = match arg {
         FnArg::Typed(it) => it,
@@ -117,8 +128,8 @@ fn lua_ctx_name(arg: &FnArg) -> Option<(Lifetime, Ident)> {
     let arg_lt = arg_ty.lifetime.clone()?;
 
     match arg_ty.elem.as_ref() {
-        Type::Path(path) => {
-            if !path.str_eq("mlua::Lua") && !path.str_eq("Lua") && !path.str_eq("LuaContext") {
+        Type::Path(TypePath { qself: None, path }) => {
+            if !is_path_lua(path) {
                 return None;
             }
         }
@@ -158,9 +169,9 @@ impl MethodSignature {
             None
         };
 
-        let mut options = EntryOptions::default();
+        let mut options = ItemOptions::default();
         for attr in &function_impl.attrs {
-            if let Some(o) = EntryOptions::from_meta(&attr.meta) {
+            if let Some(o) = ItemOptions::from_meta(&attr.meta) {
                 options = o?;
                 break;
             }
@@ -315,7 +326,7 @@ impl MethodSignature {
                 qself: None,
                 path: Path::ident_segments_generic(
                     ["std", "cell", if is_mut { "RefMut" } else { "Ref" }],
-                    Some(GenericSetting {
+                    Some(GenericOptions {
                         leading_semi: false,
                         args: [GenericArgument::Type(accessed.elem.as_ref().to_owned())],
                     }),
@@ -594,6 +605,7 @@ impl LuaMethod {
 }
 
 pub struct UserDataMetods {
+    base: ItemImpl,
     generics: Generics,
     self_ty: Box<Type>,
     ctx_lifetime: Option<Lifetime>,
@@ -655,6 +667,51 @@ impl UserDataMetods {
                 })
             })
         })
+    }
+
+    pub fn base_impl(&self) -> ItemImpl {
+        let mut result = self.base.clone();
+
+        for item in &mut result.items {
+            match item {
+                ImplItem::Const(ImplItemConst { attrs, .. })
+                | ImplItem::Type(ImplItemType { attrs, .. })
+                | ImplItem::Macro(ImplItemMacro { attrs, .. }) => {
+                    *attrs = attrs
+                        .drain(..)
+                        .filter(|it| !ItemOptions::check(&it.meta))
+                        .collect::<Vec<_>>()
+                }
+                ImplItem::Fn(ImplItemFn { attrs, sig, .. }) => {
+                    *attrs = attrs
+                        .drain(..)
+                        .filter(|it| !ItemOptions::check(&it.meta))
+                        .collect::<Vec<_>>();
+
+                    let out_type = match &sig.output {
+                        ReturnType::Default => Type::Tuple(TypeTuple {
+                            paren_token: Default::default(),
+                            elems: Punctuated::new(),
+                        }),
+                        ReturnType::Type(_, it) => (**it).clone(),
+                    };
+
+                    sig.output = ReturnType::Type(
+                        Default::default(),
+                        Box::new(Type::Path(TypePath::ident_segments_generic(
+                            ["mlua", "Result"],
+                            Some(GenericOptions {
+                                leading_semi: false,
+                                args: [GenericArgument::Type(out_type)],
+                            }),
+                        ))),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        result
     }
 
     pub fn generate_userdata_impl(&self, _options: &AttributeOptions) -> Result<ItemImpl> {
@@ -854,7 +911,7 @@ impl UserDataMetods {
             stmts,
         };
 
-        let add_methods = parse_quote! {
+        let globals_fn = parse_quote! {
             fn register_globals<'lua>(#lua_ctx: &'lua mlua::Lua) -> Result<(), mlua::Error> #block
         };
 
@@ -867,7 +924,7 @@ impl UserDataMetods {
             trait_: None,
             self_ty: self.self_ty.clone(),
             brace_token: Default::default(),
-            items: vec![add_methods],
+            items: vec![globals_fn],
         }))
     }
 }
@@ -875,8 +932,10 @@ impl UserDataMetods {
 impl Parse for UserDataMetods {
     fn parse(input: ParseStream) -> Result<Self> {
         let implementation = input.parse::<ItemImpl>()?;
+        let base = implementation.clone();
 
         let mut result = UserDataMetods {
+            base,
             generics: implementation.generics,
             self_ty: implementation.self_ty,
             ctx_lifetime: None,

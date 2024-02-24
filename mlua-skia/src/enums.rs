@@ -442,7 +442,7 @@ impl AsRef<InPremul> for LuaInPremul {
         &self.0
     }
 }
-impl<'lua> FromStr for LuaInPremul {
+impl FromStr for LuaInPremul {
     type Err = LuaError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let value = match NAME_TO_IN_PREMUL.get(value.to_ascii_lowercase().as_str()) {
@@ -466,7 +466,7 @@ impl<'lua> FromStr for LuaInPremul {
         Ok(LuaInPremul(value))
     }
 }
-impl<'lua> TryFrom<String> for LuaInPremul {
+impl TryFrom<String> for LuaInPremul {
     type Error = LuaError;
     #[inline(always)]
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -523,7 +523,7 @@ macro_rules! named_bitflags {
         ]}
 
         impl [<Lua $kind>] {
-            pub fn from_table<'lua>(table: LuaTable<'lua>) -> Result<Self, LuaError> {
+            pub fn from_table(table: LuaTable) -> Result<Self, LuaError> {
                 let mut result = $kind::empty();
                 for pair in table.pairs::<usize, String>() {
                     if let Ok((_, name)) = pair {
@@ -629,7 +629,7 @@ impl AsRef<PaintStyle> for LuaPaintStyle {
         &self.0
     }
 }
-impl<'lua> FromStr for LuaPaintStyle {
+impl FromStr for LuaPaintStyle {
     type Err = LuaError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let value = match NAME_TO_PAINT_STYLE.get(value.to_ascii_lowercase().as_str()) {
@@ -653,7 +653,7 @@ impl<'lua> FromStr for LuaPaintStyle {
         Ok(LuaPaintStyle(value))
     }
 }
-impl<'lua> TryFrom<String> for LuaPaintStyle {
+impl TryFrom<String> for LuaPaintStyle {
     type Error = LuaError;
     #[inline(always)]
     fn try_from(value: String) -> Result<Self, Self::Error> {

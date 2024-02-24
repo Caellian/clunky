@@ -1,26 +1,9 @@
 use std::vec;
 
 use proc_macro2::Span;
-use quote::ToTokens;
 use syn::{punctuated::Punctuated, *};
 
-pub trait StrEqExt {
-    fn str_eq<S: AsRef<str>>(&self, literal: S) -> bool;
-}
-
-impl StrEqExt for Path {
-    fn str_eq<S: AsRef<str>>(&self, literal: S) -> bool {
-        self.to_token_stream().to_string().replace(' ', "") == literal.as_ref().replace(' ', "")
-    }
-}
-
-impl StrEqExt for TypePath {
-    fn str_eq<S: AsRef<str>>(&self, literal: S) -> bool {
-        self.to_token_stream().to_string().replace(' ', "") == literal.as_ref().replace(' ', "")
-    }
-}
-
-pub struct GenericSetting<I: IntoIterator<Item = GenericArgument>> {
+pub struct GenericOptions<I: IntoIterator<Item = GenericArgument>> {
     pub leading_semi: bool,
     pub args: I,
 }
@@ -32,7 +15,7 @@ pub trait PathConstructorExt: Sized {
         G: IntoIterator<Item = GenericArgument>,
     >(
         segments: L,
-        generic: Option<GenericSetting<G>>,
+        generic: Option<GenericOptions<G>>,
     ) -> Self;
 
     fn ident_segments<S: ToString, L: IntoIterator<Item = S>>(segments: L) -> Self {
@@ -52,7 +35,7 @@ impl PathConstructorExt for Path {
         G: IntoIterator<Item = GenericArgument>,
     >(
         segments: L,
-        generics: Option<GenericSetting<G>>,
+        generics: Option<GenericOptions<G>>,
     ) -> Self {
         let mut segments: Vec<_> = segments
             .into_iter()
@@ -93,7 +76,7 @@ impl PathConstructorExt for TypePath {
         G: IntoIterator<Item = GenericArgument>,
     >(
         segments: L,
-        generics: Option<GenericSetting<G>>,
+        generics: Option<GenericOptions<G>>,
     ) -> Self {
         TypePath {
             qself: None,
@@ -110,7 +93,7 @@ impl PathConstructorExt for ExprPath {
         G: IntoIterator<Item = GenericArgument>,
     >(
         segments: L,
-        generics: Option<GenericSetting<G>>,
+        generics: Option<GenericOptions<G>>,
     ) -> Self {
         ExprPath {
             attrs: vec![],
@@ -128,7 +111,7 @@ impl PathConstructorExt for Expr {
         G: IntoIterator<Item = GenericArgument>,
     >(
         segments: L,
-        generics: Option<GenericSetting<G>>,
+        generics: Option<GenericOptions<G>>,
     ) -> Self {
         Expr::Path(ExprPath::ident_segments_generic(segments, generics))
     }
