@@ -28,7 +28,7 @@ clap = { version = "4.4.8", features = ["derive"] }
 # Rendering
 image = "0.24.7"
 glam = "0.25.0"
-skia-safe = { git = "https://github.com/rust-skia/rust-skia.git", rev = "03ef1ef138b5870c26b8c38d8c356d90cbecde39" }
+skia-safe = { git = "https://github.com/rust-skia/rust-skia.git", rev = "d8ff5284700778394554a59f84aceec0ce03d828" }
 mlua-skia = { path = "./mlua-skia" }
 
 # Logging & errors

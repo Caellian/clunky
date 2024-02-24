@@ -3,7 +3,7 @@
 //! This module provides a lot of utility wrappers and traits that make it
 //! easier to handle conversion from Lua types.
 
-use std::{fmt::Display, ops::Deref, sync::Arc};
+use std::{fmt::Display, mem::MaybeUninit, ops::Deref, sync::Arc};
 
 use mlua::{
     AnyUserData, Error, FromLua, Integer, IntoLua, LightUserData, Lua, MultiValue,
@@ -114,7 +114,7 @@ impl Display for LuaType {
 
 pub type ArgumentNames = Option<&'static [&'static str]>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ArgumentContext<'lua> {
     value: Vec<Value<'lua>>,
     argument_names: ArgumentNames,
@@ -526,6 +526,11 @@ impl<'lua> IsValue<'lua> for mlua::Error {
 /// Mediates conversion of _one or many_ Lua arguments into structs.
 pub trait FromArgPack<'lua>: Sized {
     fn convert(args: &mut ArgumentContext<'lua>, lua: &'lua Lua) -> LuaResult<Self>;
+    #[inline]
+    fn convert_value(value: Value<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
+        let mut args = ArgumentContext::new(MultiValue::from_iter([value]), None, None);
+        Self::convert(&mut args, lua)
+    }
 }
 
 #[macro_export]
@@ -611,6 +616,117 @@ impl<'lua, T: FromArgPack<'lua>> FromArgPack<'lua> for Vec<T> {
     }
 }
 
+impl<'lua, T: FromArgPack<'lua>, const N: usize> FromArgPack<'lua> for [T; N] {
+    fn convert(args: &mut ArgumentContext<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
+        let table = args.pop();
+        let result = Vec::<T>::convert_value(table.clone(), lua)?;
+        match result.try_into() {
+            Ok(it) => Ok(it),
+            Err(it) => {
+                let err = Error::FromLuaConversionError {
+                    from: LuaType::Table.name(),
+                    to: std::any::type_name::<[T; N]>(),
+                    message: Some(format!("expected {N} values; got: {}", it.len())),
+                };
+                args.revert(table);
+                Err(err)
+            }
+        }
+    }
+}
+
+pub struct Unpacked<T>(T);
+impl<T> Unpacked<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+impl<T> std::ops::Deref for Unpacked<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<T> std::ops::DerefMut for Unpacked<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+pub struct MaybeUnpacked<T>(T);
+impl<T> MaybeUnpacked<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+impl<T> std::ops::Deref for MaybeUnpacked<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<T> std::ops::DerefMut for MaybeUnpacked<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<'lua, T: FromArgPack<'lua>> FromArgPack<'lua> for Unpacked<Vec<T>> {
+    fn convert(args: &mut ArgumentContext<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
+        let mut result: Vec<T> = Vec::new();
+        while let Ok(value) = T::convert(args, lua) {
+            result.push(value);
+        }
+        Ok(Unpacked(result))
+    }
+}
+pub(crate) type NoneOrMany<T> = Unpacked<Vec<T>>;
+
+impl<'lua, T: FromArgPack<'lua>> FromArgPack<'lua> for MaybeUnpacked<Vec<T>> {
+    fn convert(args: &mut ArgumentContext<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
+        let first_arg = args.pop();
+        match Vec::<T>::convert_value(first_arg.clone(), lua) {
+            Ok(result) => return Ok(MaybeUnpacked(result)),
+            Err(_) => args.revert(first_arg),
+        };
+        Ok(MaybeUnpacked(Unpacked::<Vec<T>>::convert(args, lua)?.0))
+    }
+}
+
+impl<'lua, T: FromArgPack<'lua>, const N: usize> FromArgPack<'lua> for Unpacked<[T; N]> {
+    fn convert(args: &mut ArgumentContext<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
+        let mut result: MaybeUninit<[T; N]> = MaybeUninit::uninit();
+        unsafe {
+            let initial = args.clone();
+            for i in 0..N {
+                match T::convert(args, lua) {
+                    Ok(value) => {
+                        (result.as_mut_ptr() as *mut T).add(i).write(value);
+                    }
+                    Err(err) => {
+                        *args = initial;
+                        return Err(err);
+                    }
+                }
+            }
+
+            Ok(Unpacked(result.assume_init()))
+        }
+    }
+}
+impl<'lua, T: FromArgPack<'lua>, const N: usize> FromArgPack<'lua> for MaybeUnpacked<[T; N]> {
+    fn convert(args: &mut ArgumentContext<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
+        let first_arg = args.pop();
+        match <[T; N]>::convert_value(first_arg.clone(), lua) {
+            Ok(result) => return Ok(MaybeUnpacked(result)),
+            Err(_) => args.revert(first_arg),
+        };
+        Ok(MaybeUnpacked(Unpacked::<[T; N]>::convert(args, lua)?.0))
+    }
+}
+
+// FIXME: Reverse tuples on error
 macro_rules! from_arg_pack_tuple {
     ($($A:ident),*) => {
         impl<'lua$(,$A)*> FromArgPack<'lua> for ($($A,)*)
@@ -952,134 +1068,6 @@ where
     fn unwrap_or_else_t(self, value_fn: impl Fn() -> T) -> T {
         self.ok().unwrap_or_else_t(value_fn)
     }
-}
-
-pub mod combinators {
-    use super::*;
-    use std::any::type_name;
-    use std::sync::OnceLock;
-
-    pub enum NeverT {}
-    impl<'lua> FromLua<'lua> for NeverT {
-        fn from_lua(lua_value: Value<'lua>, _: &'lua Lua) -> LuaResult<Self> {
-            Err(mlua::Error::FromLuaConversionError {
-                from: lua_value.type_name(),
-                to: "!",
-                message: Some("no type can be converted into ! type".to_string()),
-            })
-        }
-    }
-
-    macro_rules! impl_one_of {
-            ($($ts: ident)*) => {
-                #[non_exhaustive]
-                #[allow(private_interfaces)]
-                pub enum OneOf<$($ts = NeverT),*> {
-                    $($ts($ts)),*
-                }
-
-                #[allow(unused)]
-                impl<$($ts),*> OneOf<$($ts),*> {
-                    fn expected_types() -> &'static str {
-                        static STORE: OnceLock<&'static str> = OnceLock::new();
-
-                        STORE.get_or_init(|| {
-                            let mut result = String::new();
-                            for entry in [$(type_name::<$ts>()),*] {
-                                if entry == type_name::<NeverT>() {
-                                    continue
-                                }
-
-                                if !result.is_empty() {
-                                    result.push(',');
-                                }
-
-                                result.extend(entry.chars());
-                            }
-                            result.leak()
-                        })
-                    }
-
-                    fn target_t() -> &'static str {
-                        static STORE: OnceLock<&'static str> = OnceLock::new();
-
-                        STORE.get_or_init(|| {
-                            format!("OneOf<{}>", Self::expected_types()).leak()
-                        })
-                    }
-
-                    fn type_name(&self) -> &'static str {
-                        match self {
-                            $(
-                                Self::$ts(_) => type_name::<$ts>(),
-                            )*
-                        }
-                    }
-
-                    paste::paste!{$(
-                        pub fn [<is_ $ts:lower>](&self) -> bool {
-                            match self {
-                                Self::$ts(_) => true,
-                                _ => false,
-                            }
-                        }
-                        pub fn [<as_ $ts:lower>](&self) -> Option<&$ts> {
-                            match self {
-                                Self::$ts(it) => Some(it),
-                                _ => None,
-                            }
-                        }
-                        pub fn [<unwrap_ $ts:lower>](self) -> $ts {
-                            match self {
-                                Self::$ts(it) => it,
-                                other => panic!(concat!["expected ", stringify!($ts), "; found {:?} variant instead"], other.type_name()),
-                            }
-                        }
-                    )*}
-                }
-
-                impl<'lua, $($ts),*> FromLua<'lua> for OneOf<$($ts),*> where $($ts: FromLua<'lua>),* {
-                    fn from_lua(value: Value<'lua>, lua: &'lua Lua) -> LuaResult<Self> {
-                        $(
-                            if type_name::<$ts>() != type_name::<NeverT>() { // optimize NeverT checks away
-                                if let Ok(it) = $ts::from_lua(value.clone(), lua) {
-                                    return Ok(Self::$ts(it));
-                                }
-                            }
-                        )*
-
-                        Err(mlua::Error::FromLuaConversionError {
-                            from: value.type_name(),
-                            to: Self::target_t(),
-                            message: Some(format!("unable to convert into any of expected types: {}", Self::expected_types()))
-                        })
-                    }
-                }
-            };
-        }
-
-    impl_one_of!(A B C D E F G H I J K L M N O P);
-
-    /*
-    /// A vec that can be read as either a table or a flat sequence of `T`
-    /// arguments.
-    pub struct FlatVec<T>(pub Vec<T>);
-
-    impl<'lua, T: FromLuaMulti<'lua>> FromLuaMulti<'lua> for FlatVec<T> {
-        fn from_lua_multi(
-            values: &mut MultiValue<'lua>,
-            lua: &'lua Lua,
-        ) -> rlua::prelude::LuaResult<Self> {
-            let mut values = values.into_iter();
-            let first = match values.next() {
-                Some(it) => it,
-                None => return Ok(FlatVec(vec![])),
-            };
-            if let Ok(direct) = FromLua::from_lua(first, lua) {
-                return Ok(FlatVec(direct));
-            }
-        }
-    } */
 }
 
 /// Allows declaring a wrapper type and automatically implementing all of the

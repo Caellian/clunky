@@ -672,6 +672,10 @@ impl UserDataMetods {
     pub fn base_impl(&self) -> ItemImpl {
         let mut result = self.base.clone();
 
+        // TODO: Replace LuaFallible with Option arguments
+        // TODO: Replace NoneOrMany with Vec arguments
+        // TODO: Unwrap MaybeUnpacked and Unpacked arguments
+
         for item in &mut result.items {
             match item {
                 ImplItem::Const(ImplItemConst { attrs, .. })

@@ -38,7 +38,7 @@ pub(crate) mod util;
 pub use crate::args::*;
 pub use crate::enums::*;
 use crate::ext::skia::*;
-use crate::lua::{combinators::*, *};
+use crate::lua::*;
 
 pub trait StructToTable<'lua> {
     fn to_table(&self, lua: &'lua LuaContext) -> LuaResult<LuaTable<'lua>>;
@@ -59,6 +59,7 @@ macro_rules! struct_to_table {
     };
 }
 
+// TODO: macro used once
 struct_to_table! { FontMetrics: {
     "top": |metrics, _| metrics.top,
     "ascent": |metrics, _| metrics.ascent,
@@ -491,10 +492,7 @@ wrap_skia_handle!(ImageFilter);
 #[allow(clippy::too_many_arguments)]
 impl LuaImageFilter {
     pub fn arithmetic(
-        k1: f32,
-        k2: f32,
-        k3: f32,
-        k4: f32,
+        coefficients: MaybeUnpacked<[f32; 4]>,
         enforce_pm_color: bool,
         background: LuaFallible<LuaImageFilter>,
         foreground: LuaFallible<LuaImageFilter>,
@@ -510,10 +508,10 @@ impl LuaImageFilter {
             .unwrap_or_default();
 
         Ok(image_filters::arithmetic(
-            k1,
-            k2,
-            k3,
-            k4,
+            coefficients[0],
+            coefficients[1],
+            coefficients[2],
+            coefficients[3],
             enforce_pm_color,
             background,
             foreground,
@@ -888,7 +886,7 @@ impl LuaImageFilter {
         location: LuaPoint<3>,
         light_color: LuaColor,
         surface_scale: f32,
-        kd: f32,
+        specular_reflectance: f32,
         input: LuaFallible<LuaImageFilter>,
         crop_rect: LuaFallible<LuaRect>,
     ) -> Option<LuaImageFilter> {
@@ -903,7 +901,7 @@ impl LuaImageFilter {
             location,
             light_color,
             surface_scale,
-            kd,
+            specular_reflectance,
             input,
             crop_rect,
         )
@@ -913,7 +911,7 @@ impl LuaImageFilter {
         location: LuaPoint<3>,
         light_color: LuaColor,
         surface_scale: f32,
-        ks: f32,
+        specular_reflectance: f32,
         shininess: f32,
         input: LuaFallible<LuaImageFilter>,
         crop_rect: LuaFallible<LuaRect>,
@@ -929,7 +927,7 @@ impl LuaImageFilter {
             location,
             light_color,
             surface_scale,
-            ks,
+            specular_reflectance,
             shininess,
             input,
             crop_rect,
@@ -953,7 +951,7 @@ impl LuaImageFilter {
         cutoff_angle: f32,
         light_color: LuaColor,
         surface_scale: f32,
-        kd: f32,
+        specular_reflectance: f32,
         input: LuaFallible<LuaImageFilter>,
         crop_rect: LuaFallible<LuaRect>,
     ) -> Option<LuaImageFilter> {
@@ -972,7 +970,7 @@ impl LuaImageFilter {
             cutoff_angle,
             light_color,
             surface_scale,
-            kd,
+            specular_reflectance,
             input,
             crop_rect,
         )
@@ -985,7 +983,7 @@ impl LuaImageFilter {
         cutoff_angle: f32,
         light_color: LuaColor,
         surface_scale: f32,
-        ks: f32,
+        specular_reflectance: f32,
         shininess: f32,
         input: LuaFallible<LuaImageFilter>,
         crop_rect: LuaFallible<LuaRect>,
@@ -1004,7 +1002,7 @@ impl LuaImageFilter {
             cutoff_angle,
             light_color,
             surface_scale,
-            ks,
+            specular_reflectance,
             shininess,
             input,
             crop_rect,
@@ -1274,10 +1272,14 @@ impl LuaStrokeRec {
             LuaValue::Table(paint_like) => LuaPaint::try_from((paint_like, lua))?,
             LuaValue::UserData(ud) if ud.is::<LuaPaint>() => ud.borrow::<LuaPaint>()?.to_owned(),
             other => {
-                return Err(LuaError::RuntimeError(format!(
-                    "StrokeRec constructor requires string or Paint; got: {}",
-                    other.type_name()
-                )))
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "Paint",
+                    message: Some(format!(
+                        "StrokeRec constructor requires string or Paint; got: {}",
+                        other.type_name()
+                    )),
+                })
             }
         };
 
@@ -1288,9 +1290,7 @@ impl LuaStrokeRec {
         );
 
         match args.next() {
-            None => {
-                return Ok(stroke_rec)
-            }
+            None => return Ok(stroke_rec),
             Some(LuaValue::String(style)) => {
                 let stroke_and_fill = *LuaPaintStyle::try_from(style)? != PaintStyle::Stroke;
                 let width = stroke_rec.0.width();
@@ -1304,9 +1304,16 @@ impl LuaStrokeRec {
                 stroke_rec.0.set_res_scale(number as f32);
                 return Ok(stroke_rec);
             }
-            Some(other) => return Err(LuaError::RuntimeError(
-                format!("StrokeRec constructor requires style (string) or resScale (number) as second argument; got: {}", other.type_name())
-            )),
+            Some(other) => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "PaintStyle (string) or scale (number)",
+                    message: Some(
+                        "StrokeRec constructor requires style or resScale as second argument"
+                            .to_string(),
+                    ),
+                })
+            }
         };
 
         match args.next() {
@@ -1318,10 +1325,13 @@ impl LuaStrokeRec {
                 stroke_rec.0.set_res_scale(number as f32);
             }
             Some(other) => {
-                return Err(LuaError::RuntimeError(format!(
-                    "StrokeRec constructor requires resScale (number) as third argument; got: {}",
-                    other.type_name()
-                )))
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "scale (number)",
+                    message: Some(
+                        "StrokeRec constructor requires resScale as third argument".to_string(),
+                    ),
+                })
             }
         };
 
@@ -1597,6 +1607,7 @@ impl LuaMatrix {
             }
         }
     }
+    // TODO: use __index for Matrix
     pub fn set(&mut self, pos: LuaPoint, value: f32) -> bool {
         let [col, row] = pos.as_array().map(|it| it as usize);
         match self {
@@ -1851,13 +1862,13 @@ wrap_skia_handle!(Paint);
 type_like_table!(Paint: |value: LuaTable, lua: &'lua Lua| {
     let mut paint = Paint::default();
 
-    let color_space = value.try_get_t::<_, LuaColorSpace>("color_space", lua)?;
+    let color_space = value.try_get_t::<_, LuaColorSpace>("colorSpace", lua)?;
     if let Ok(color) = LuaColor::from_lua(LuaValue::Table(value.clone()), lua) {
         let color: Color4f = color.into();
         paint.set_color4f(color, color_space.as_ref());
     }
 
-    if let Some(aa) = value.try_get::<_, bool>("anti_alias", lua)? {
+    if let Some(aa) = value.try_get::<_, bool>("antiAlias", lua)? {
         paint.set_anti_alias(aa);
     }
 
@@ -1865,32 +1876,32 @@ type_like_table!(Paint: |value: LuaTable, lua: &'lua Lua| {
         paint.set_dither(dither);
     }
 
-    if let Some(image_filter) = value.try_get_t::<_, LuaImageFilter>("image_filter",lua)? {
+    if let Some(image_filter) = value.try_get_t::<_, LuaImageFilter>("imageFilter",lua)? {
         paint.set_image_filter(image_filter);
     }
-    if let Some(mask_filter) = value.try_get_t::<_, LuaMaskFilter>("mask_filter",lua)? {
+    if let Some(mask_filter) = value.try_get_t::<_, LuaMaskFilter>("maskFilter",lua)? {
         paint.set_mask_filter(mask_filter);
     }
-    if let Some(color_filter) = value.try_get_t::<_, LuaColorFilter>("color_filter", lua)? {
+    if let Some(color_filter) = value.try_get_t::<_, LuaColorFilter>("colorFilter", lua)? {
         paint.set_color_filter(color_filter);
     }
 
     if let Some(style) = value.try_get_t::<_, LuaPaintStyle>("style", lua)? {
         paint.set_style(style);
     }
-    if let Some(cap) = value.try_get_t::<_, LuaPaintCap>("stroke_cap", lua)?.or(value.try_get_t::<_, LuaPaintCap>("cap", lua)?) {
+    if let Some(cap) = value.try_get_t::<_, LuaPaintCap>("strokeCap", lua)?.or(value.try_get_t::<_, LuaPaintCap>("cap", lua)?) {
         paint.set_stroke_cap(cap);
     }
-    if let Some(join) = value.try_get_t::<_, LuaPaintJoin>("stroke_join", lua)?.or(value.try_get_t::<_, LuaPaintJoin>("join", lua)?) {
+    if let Some(join) = value.try_get_t::<_, LuaPaintJoin>("strokeJoin", lua)?.or(value.try_get_t::<_, LuaPaintJoin>("join", lua)?) {
         paint.set_stroke_join(join);
     }
-    if let Some(width) = value.try_get::<_, f32>("stroke_width", lua)?.or(value.try_get::<_, f32>("width", lua)?) {
+    if let Some(width) = value.try_get::<_, f32>("strokeWidth", lua)?.or(value.try_get::<_, f32>("width", lua)?) {
         paint.set_stroke_width(width);
     }
-    if let Some(miter) = value.try_get::<_, f32>("stroke_miter", lua)?.or(value.try_get::<_, f32>("miter", lua)?) {
+    if let Some(miter) = value.try_get::<_, f32>("strokeMiter", lua)?.or(value.try_get::<_, f32>("miter", lua)?) {
         paint.set_stroke_miter(miter);
     }
-    if let Some(path_effect) = value.try_get_t::<_, LuaPathEffect>("path_effect", lua)? {
+    if let Some(path_effect) = value.try_get_t::<_, LuaPathEffect>("pathEffect", lua)? {
         paint.set_path_effect(path_effect);
     }
 
@@ -2084,8 +2095,8 @@ impl LuaPath {
         self.0.add_arc(oval, start_angle, sweep_angle);
         Ok(())
     }
-    pub fn add_circle(&mut self, point: LuaPoint, radius: f32, dir: Option<LuaPathDirection>) {
-        self.0.add_circle(point, radius, dir.map_t());
+    pub fn add_circle(&mut self, center: LuaPoint, radius: f32, dir: Option<LuaPathDirection>) {
+        self.0.add_circle(center, radius, dir.map_t());
         Ok(())
     }
     pub fn add_oval(&mut self, oval: LuaRect, dir: Option<LuaPathDirection>, start: Option<usize>) {
@@ -2095,12 +2106,20 @@ impl LuaPath {
             .add_oval(oval, Some((dir.unwrap_or_default_t(), start)));
         Ok(())
     }
-    pub fn add_path(&mut self, other: LuaPath, point: LuaPoint, mode: Option<LuaAddPathMode>) {
-        self.0.add_path(&other.0, point, mode.map_t());
+    pub fn add_path(&mut self, other: LuaPath, offset: LuaPoint, mode: Option<LuaAddPathMode>) {
+        self.0.add_path(&other.0, offset, mode.map_t());
         Ok(())
     }
-    pub fn add_poly(&mut self, points: Vec<LuaPoint>, close: bool) {
-        let points: Vec<_> = points.into_iter().map(LuaPoint::into).collect();
+    pub fn add_poly(&mut self, points: MaybeUnpacked<Vec<LuaPoint>>, close: bool) {
+        if points.is_empty() {
+            self.0.close();
+            return Ok(());
+        }
+        let points: Vec<_> = points
+            .into_inner()
+            .into_iter()
+            .map(LuaPoint::into)
+            .collect();
         self.0.add_poly(&points, close);
         Ok(())
     }
@@ -2154,8 +2173,8 @@ impl LuaPath {
     pub fn compute_tight_bounds(&self) -> LuaRect {
         Ok(LuaRect::from(self.0.compute_tight_bounds()))
     }
-    pub fn conic_to(&mut self, p1: LuaPoint, p2: LuaPoint, w: f32) {
-        self.0.conic_to(p1, p2, w);
+    pub fn conic_to(&mut self, points: MaybeUnpacked<[LuaPoint; 2]>, w: f32) {
+        self.0.conic_to(points[0], points[1], w);
         Ok(())
     }
     pub fn conservatively_contains_rect(&self, rect: LuaRect) -> bool {
@@ -2171,8 +2190,8 @@ impl LuaPath {
     pub fn count_verbs(&self) -> usize {
         Ok(self.0.count_verbs())
     }
-    pub fn cubic_to(&mut self, p1: LuaPoint, p2: LuaPoint, p3: LuaPoint) {
-        self.0.cubic_to(p1, p2, p3);
+    pub fn cubic_to(&mut self, points: MaybeUnpacked<[LuaPoint; 3]>) {
+        self.0.cubic_to(points[0], points[1], points[2]);
         Ok(())
     }
     pub fn get_bounds(&self) -> LuaRect {
@@ -2298,8 +2317,8 @@ impl LuaPath {
         self.0.offset(d);
         Ok(())
     }
-    pub fn quad_to(&mut self, p1: LuaPoint, p2: LuaPoint) {
-        self.0.quad_to(p1, p2);
+    pub fn quad_to(&mut self, points: MaybeUnpacked<[LuaPoint; 2]>) {
+        self.0.quad_to(points[0], points[1]);
         Ok(())
     }
     pub fn r_arc_to(
@@ -2457,17 +2476,14 @@ impl LuaRRect {
         self.0.set_rect(rect);
         Ok(())
     }
-    pub fn set_rect_radii(&mut self, rect: LuaRect, radii: Vec<LuaPoint>) {
+    pub fn set_rect_radii(&mut self, rect: LuaRect, radii: MaybeUnpacked<[LuaPoint; 4]>) {
         let rect: Rect = rect.into();
-        if radii.len() < 4 {
-            // TODO: Take exactly 4 LuaPoints, maybe unpacked
-            return Err(LuaError::RuntimeError(format!(
-                "RRect:setRectRadii expects 4 radii points; got {}",
-                radii.len()
-            )));
-        }
-        let radii: Vec<Point> = radii.into_iter().take(4).map(LuaPoint::into).collect();
-        let radii: [Point; 4] = radii.try_into().expect("radii should have 4 Points");
+        let radii: [Point; 4] = radii
+            .into_iter()
+            .map(LuaPoint::into)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("radii should have 4 Points");
         self.0.set_rect_radii(rect, &radii);
         Ok(())
     }
@@ -2655,15 +2671,14 @@ impl LuaSurfaceProps {
 }
 
 type_like_table!(SurfaceProps: |value: LuaTable| {
-    let flags = match value.get::<_, OneOf<LuaTable, LuaValue>>("flags") {
-        Ok(OneOf::A(it)) => LuaSurfacePropsFlags::from_table(it)?.0,
-        Ok(OneOf::B(LuaNil)) => {
+    let flags = match value.get::<_, LuaValue>("flags") {
+        Ok(LuaValue::Table(it)) => LuaSurfacePropsFlags::from_table(it)?.0,
+        Ok(LuaNil) => {
             SurfacePropsFlags::empty()
         }
-        Ok(OneOf::B(other)) => {
+        Ok(other) => {
             return Err(LuaError::FromLuaConversionError { from: other.type_name(), to: "SurfacePropFlags", message: None })
         }
-        Ok(_) => unreachable!(),
         Err(other) => return Err(other)
     };
     let pixel_geometry = LuaPixelGeometry::try_from(value.get::<_, String>("pixel_geometry").unwrap_or("unknown".to_string()))?;
@@ -2928,11 +2943,38 @@ pub struct LuaText {
     pub encoding: TextEncoding,
 }
 
+impl EncodedText for LuaText {
+    fn as_raw(&self) -> (*const std::ffi::c_void, usize, TextEncoding) {
+        match self.encoding {
+            TextEncoding::UTF8 => (
+                self.text.as_bytes().as_ptr() as _,
+                size_of::<u8>(),
+                TextEncoding::UTF8,
+            ),
+            TextEncoding::UTF16 => (
+                self.text.as_bytes().as_ptr() as _,
+                size_of::<u16>(),
+                TextEncoding::UTF16,
+            ),
+            TextEncoding::UTF32 => (
+                self.text.as_bytes().as_ptr() as _,
+                size_of::<u32>(),
+                TextEncoding::UTF32,
+            ),
+            TextEncoding::GlyphId => (
+                self.text.as_bytes().as_ptr() as _,
+                size_of::<GlyphId>(),
+                TextEncoding::GlyphId,
+            ),
+        }
+    }
+}
+
 fn encoding_size(encoding: TextEncoding) -> usize {
     match encoding {
-        TextEncoding::UTF8 => 1,
-        TextEncoding::UTF16 => 2,
-        TextEncoding::UTF32 => 4,
+        TextEncoding::UTF8 => size_of::<u8>(),
+        TextEncoding::UTF16 => size_of::<u16>(),
+        TextEncoding::UTF32 => size_of::<u32>(),
         TextEncoding::GlyphId => size_of::<GlyphId>(),
     }
 }
@@ -3080,10 +3122,17 @@ impl LuaFontMgr {
 
 wrap_skia_handle!(Typeface);
 
+impl Default for LuaTypeface {
+    fn default() -> Self {
+        let mgr = FontMgr::default();
+        LuaTypeface(mgr.legacy_make_typeface(None, FontStyle::normal()).unwrap())
+    }
+}
+
 #[lua_methods(lua_name: Typeface)]
 impl LuaTypeface {
     pub fn make_default() -> LuaTypeface {
-        Ok(LuaTypeface(Typeface::default()))
+        Result::<LuaTypeface, _>::Ok(Default::default())
     }
     // NYI: Typeface::make_empty by skia_safe
     pub fn make_from_name(
@@ -3188,8 +3237,7 @@ impl LuaTypeface {
     // NYI: openStream by skia_safe
     pub fn text_to_glyphs(&self, text: LuaText) -> Vec<GlyphId> {
         let mut result = Vec::with_capacity(text.text.len());
-        self.0
-            .text_to_glyphs(text.text.as_bytes(), text.encoding, result.as_mut_slice());
+        self.0.text_to_glyphs(text, result.as_mut_slice());
         Ok(result)
     }
     pub fn string_to_glyphs(&self, text: String) -> Vec<GlyphId> {
@@ -3207,149 +3255,13 @@ impl LuaTypeface {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct FromLuaFontWeight(pub i32);
-
-impl FromLuaFontWeight {
-    pub fn to_skia_weight(&self) -> Weight {
-        Weight::from(self.0)
-    }
-}
-
-impl<'lua> FromArgPack<'lua> for FromLuaFontWeight {
-    fn convert(args: &mut ArgumentContext<'lua>, _lua: &'lua Lua) -> LuaResult<Self> {
-        static EXPECTED: &str = "'invisible', 'thin', 'extra_light', 'light', 'normal', 'medium', 'semi_bold', 'bold', 'extra_bold', 'black', 'extra_black'";
-        match args.pop() {
-            LuaNil => Ok(FromLuaFontWeight(*Weight::NORMAL)),
-            LuaValue::Integer(number) => {
-                if number < 0 {
-                    return Err(LuaError::RuntimeError(
-                        "font weight can't be a negative value".to_string(),
-                    ));
-                }
-                Ok(FromLuaFontWeight(number as i32))
-            }
-            LuaValue::Number(number) => {
-                if number < 0. {
-                    return Err(LuaError::RuntimeError(
-                        "font weight can't be a negative value".to_string(),
-                    ));
-                }
-                if number.is_infinite() {
-                    return Err(LuaError::RuntimeError(
-                        "font weight must be finite".to_string(),
-                    ));
-                }
-                if number.is_nan() {
-                    return Err(LuaError::RuntimeError(
-                        "invalid (NaN) font weight".to_string(),
-                    ));
-                }
-                Ok(FromLuaFontWeight(number.floor() as i32))
-            }
-            LuaValue::String(name) => match name.to_str()? {
-                "invisible" => Ok(FromLuaFontWeight(*Weight::INVISIBLE)),
-                "thin" => Ok(FromLuaFontWeight(*Weight::THIN)),
-                "extra_light" => Ok(FromLuaFontWeight(*Weight::EXTRA_LIGHT)),
-                "light" => Ok(FromLuaFontWeight(*Weight::LIGHT)),
-                "normal" => Ok(FromLuaFontWeight(*Weight::NORMAL)),
-                "medium" => Ok(FromLuaFontWeight(*Weight::MEDIUM)),
-                "semi_bold" => Ok(FromLuaFontWeight(*Weight::SEMI_BOLD)),
-                "bold" => Ok(FromLuaFontWeight(*Weight::BOLD)),
-                "extra_bold" => Ok(FromLuaFontWeight(*Weight::EXTRA_BOLD)),
-                "black" => Ok(FromLuaFontWeight(*Weight::BLACK)),
-                "extra_black" => Ok(FromLuaFontWeight(*Weight::EXTRA_BLACK)),
-                other => Err(LuaError::RuntimeError(format!(
-                    "unknown weight name: '{}'; expected a number or one of: {}",
-                    other, EXPECTED
-                ))),
-            },
-            other => Err(LuaError::RuntimeError(format!(
-                "invalid font weight: '{:?}'; expected a number or name ({})",
-                other, EXPECTED
-            ))),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct FromLuaFontWidth(pub i32);
-
-impl FromLuaFontWidth {
-    pub fn to_skia_width(&self) -> Width {
-        Width::from(self.0)
-    }
-}
-
-impl<'lua> FromArgPack<'lua> for FromLuaFontWidth {
-    fn convert(args: &mut ArgumentContext<'lua>, _lua: &'lua Lua) -> LuaResult<Self> {
-        static EXPECTED: &str = "'invisible', 'thin', 'extra_light', 'light', 'normal', 'medium', 'semi_bold', 'bold', 'extra_bold', 'black', 'extra_black'";
-        match args.pop() {
-            LuaNil => Ok(FromLuaFontWidth(*Width::NORMAL)),
-            LuaValue::Integer(number) => {
-                if number < 0 {
-                    return Err(LuaError::RuntimeError(
-                        "font width can't be a negative value".to_string(),
-                    ));
-                }
-                Ok(FromLuaFontWidth(number as i32))
-            }
-            LuaValue::Number(number) => {
-                if number < 0. {
-                    return Err(LuaError::RuntimeError(
-                        "font width can't be a negative value".to_string(),
-                    ));
-                }
-                if number.is_infinite() {
-                    return Err(LuaError::RuntimeError(
-                        "font width must be finite".to_string(),
-                    ));
-                }
-                if number.is_nan() {
-                    return Err(LuaError::RuntimeError(
-                        "invalid (NaN) font width".to_string(),
-                    ));
-                }
-                Ok(FromLuaFontWidth(number.floor() as i32))
-            }
-            LuaValue::String(name) => match name.to_str()? {
-                "ultra_condensed" => Ok(FromLuaFontWidth(*Width::ULTRA_CONDENSED)),
-                "extra_condensed" => Ok(FromLuaFontWidth(*Width::EXTRA_CONDENSED)),
-                "condensed" => Ok(FromLuaFontWidth(*Width::CONDENSED)),
-                "semi_condensed" => Ok(FromLuaFontWidth(*Width::SEMI_CONDENSED)),
-                "normal" => Ok(FromLuaFontWidth(*Width::NORMAL)),
-                "semi_expanded" => Ok(FromLuaFontWidth(*Width::SEMI_EXPANDED)),
-                "expanded" => Ok(FromLuaFontWidth(*Width::EXPANDED)),
-                "extra_expanded" => Ok(FromLuaFontWidth(*Width::EXTRA_EXPANDED)),
-                "ultra_expanded" => Ok(FromLuaFontWidth(*Width::ULTRA_EXPANDED)),
-                other => Err(LuaError::FromLuaConversionError {
-                    from: "string",
-                    to: "Width",
-                    message: Some(format!(
-                        "unknown width name: '{}'; expected a number or one of: {}",
-                        other, EXPECTED
-                    )),
-                }),
-            },
-            other => Err(LuaError::FromLuaConversionError {
-                from: other.type_name(),
-                to: "Width",
-                message: Some(format!(
-                    "invalid font width: '{:?}'; expected a number or name ({})",
-                    other, EXPECTED
-                )),
-            }),
-        }
-    }
-}
-
 wrap_skia_handle!(FontStyle);
 
 #[lua_methods(lua_name: FontStyle)]
 impl LuaFontStyle {
     pub fn make(
-        weight: Option<FromLuaFontWeight>,
-        width: Option<FromLuaFontWidth>,
+        weight: Option<LuaFontWeight>,
+        width: Option<LuaFontWidth>,
         slant: Option<LuaSlant>,
     ) -> LuaFontStyle {
         let weight = weight
@@ -3360,11 +3272,11 @@ impl LuaFontStyle {
         Ok(LuaFontStyle(FontStyle::new(weight, width, slant)))
     }
 
-    pub fn weight(&self) -> i32 {
-        Ok(*self.0.weight())
+    pub fn weight(&self) -> LuaFontWeight {
+        Ok(LuaFontWeight(*self.0.weight()))
     }
-    pub fn width(&self) -> i32 {
-        Ok(*self.0.width())
+    pub fn width(&self) -> LuaFontWidth {
+        Ok(LuaFontWidth(*self.0.width()))
     }
     pub fn slant(&self) -> LuaSlant {
         Ok(LuaSlant(self.0.slant()))
@@ -3391,7 +3303,7 @@ impl LuaFont {
     }
 
     pub fn count_text(&self, text: LuaText) -> usize {
-        Ok(self.0.count_text(text.text.as_bytes(), text.encoding))
+        Ok(self.0.count_text(text))
     }
     pub fn get_bounds(&self, glyphs: Vec<GlyphId>, paint: Option<LuaPaint>) -> Vec<LuaRect> {
         let mut bounds = [Rect::new_empty()].repeat(glyphs.len());
@@ -3452,21 +3364,20 @@ impl LuaFont {
     pub fn get_spacing(&self) -> f32 {
         Ok(self.0.spacing())
     }
-    pub fn get_typeface(&self) -> Option<LuaTypeface> {
-        Ok(self.0.typeface().map(LuaTypeface))
+    pub fn get_typeface(&self) -> LuaTypeface {
+        Ok(LuaTypeface(self.0.typeface()))
     }
     pub fn get_widths(&self, glyphs: Vec<GlyphId>) -> Vec<f32> {
         let mut widths = Vec::with_capacity(glyphs.len());
         self.0.get_widths(&glyphs, &mut widths);
         Ok(widths)
     }
-    pub fn get_widths_bounds<'lua>(
+    pub fn get_widths_bounds(
         &self,
-        lua: &'lua LuaContext,
         glyphs: Vec<GlyphId>,
         paint: Option<LuaPaint>,
-    ) -> LuaTable<'lua> {
-        let mut widths = Vec::with_capacity(glyphs.len());
+    ) -> (Vec<f32>, Vec<LuaRect>) {
+        let mut widths: Vec<f32> = Vec::with_capacity(glyphs.len());
         let mut bounds = Vec::with_capacity(glyphs.len());
         self.0.get_widths_bounds(
             &glyphs,
@@ -3474,13 +3385,10 @@ impl LuaFont {
             Some(&mut bounds),
             paint.map(LuaPaint::unwrap).as_ref(),
         );
-        let result = lua.create_table()?;
-        result.set("widths", widths)?;
-        result.set(
-            "bounds",
+        Ok((
+            widths,
             bounds.into_iter().map(LuaRect::from).collect::<Vec<_>>(),
-        )?;
-        Ok(result)
+        ))
     }
     pub fn get_x_pos(&self, glyphs: Vec<GlyphId>, origin: Option<f32>) -> Vec<f32> {
         let mut result = Vec::with_capacity(glyphs.len());
@@ -3509,11 +3417,9 @@ impl LuaFont {
         Ok(self.0.with_size(size).map(LuaFont))
     }
     pub fn measure_text(&self, text: LuaText, paint: Option<LuaPaint>) -> (f32, LuaRect) {
-        let measurements = self.0.measure_text(
-            text.text.as_bytes(),
-            text.encoding,
-            paint.map(LuaPaint::unwrap).as_ref(),
-        );
+        let measurements = self
+            .0
+            .measure_text(text, paint.map(LuaPaint::unwrap).as_ref());
         Ok((measurements.0, LuaRect::from(measurements.1)))
     }
     pub fn set_baseline_snap(&mut self, baseline_snap: bool) {
@@ -3565,8 +3471,7 @@ impl LuaFont {
         Ok(())
     }
     pub fn text_to_glyphs(&self, text: LuaText) {
-        self.0
-            .text_to_glyphs_vec(text.text.as_bytes(), text.encoding);
+        self.0.text_to_glyphs_vec(text);
         Ok(())
     }
     pub fn unichars_to_glyphs(&self, unichars: Vec<Unichar>) -> Vec<GlyphId> {
@@ -3589,10 +3494,7 @@ impl LuaTextBlob {
         font: LuaFont,
     ) -> Option<LuaTextBlob> {
         let pos: Vec<Point> = pos.into_iter().map(LuaPoint::into).collect();
-        Ok(
-            TextBlob::from_pos_text(text.text.as_bytes(), &pos, &font.0, text.encoding)
-                .map(LuaTextBlob),
-        )
+        Ok(TextBlob::from_pos_text(text, &pos, &font.0).map(LuaTextBlob))
     }
     pub fn make_from_pos_text_h(
         text: LuaText,
@@ -3600,21 +3502,14 @@ impl LuaTextBlob {
         const_y: f32,
         font: LuaFont,
     ) -> Option<LuaTextBlob> {
-        Ok(TextBlob::from_pos_text_h(
-            text.text.as_bytes(),
-            &x_pos,
-            const_y,
-            &font.0,
-            text.encoding,
-        )
-        .map(LuaTextBlob))
+        Ok(TextBlob::from_pos_text_h(text, &x_pos, const_y, &font.0).map(LuaTextBlob))
     }
     // TODO: make_from_RSXform()
     pub fn make_from_string(string: String, font: LuaFont) -> Option<LuaTextBlob> {
         Ok(TextBlob::new(string, &font.0).map(LuaTextBlob))
     }
     pub fn make_from_text(text: LuaText, font: LuaFont) -> Option<LuaTextBlob> {
-        Ok(TextBlob::from_text(text.text.as_bytes(), text.encoding, &font.0).map(LuaTextBlob))
+        Ok(TextBlob::from_text(text, &font.0).map(LuaTextBlob))
     }
 
     pub fn bounds(&self) -> LuaRect {
@@ -3808,48 +3703,15 @@ impl<'a> LuaCanvas<'a> {
     }
     pub fn draw_patch(
         &self,
-        cubics_table: Vec<LuaPoint>,
-        colors: LuaFallible<Vec<LuaColor>>,
-        tex_coords: LuaFallible<Vec<LuaPoint>>,
+        cubics: [LuaPoint; 12],
+        colors: LuaFallible<[LuaColor; 4]>,
+        tex_coords: LuaFallible<[LuaPoint; 4]>,
         blend_mode: LuaBlendMode,
         paint: LikePaint,
     ) {
-        if cubics_table.len() != 12 {
-            return Err(LuaError::RuntimeError(
-                "expected 12 cubic points".to_string(),
-            ));
-        }
-        let mut cubics = [Point::new(0.0, 0.0); 12];
-        for i in 0..12 {
-            cubics[i] = cubics_table[i].into();
-        }
-
-        let colors = match colors.into_inner() {
-            Some(colors) => {
-                let mut result = [Color::TRANSPARENT; 4];
-                for i in 0..4 {
-                    result[i] = colors[i].into();
-                }
-                Some(result)
-            }
-            None => None,
-        };
-
-        let tex_coords = match tex_coords.into_inner() {
-            Some(coords) => {
-                if coords.len() != 4 {
-                    return Err(LuaError::RuntimeError(
-                        "expected 4 texture coordinates".to_string(),
-                    ));
-                }
-                let mut result = [Point::new(0.0, 0.0); 4];
-                for i in 0..4 {
-                    result[i] = coords[i].into();
-                }
-                Some(result)
-            }
-            None => None,
-        };
+        let cubics = cubics.map(Into::into);
+        let colors = colors.into_inner().map(|it| it.map(Into::into));
+        let tex_coords = tex_coords.into_inner().map(|it| it.map(Into::into));
 
         self.canvas().draw_patch(
             &cubics,
@@ -3894,9 +3756,8 @@ impl<'a> LuaCanvas<'a> {
         Ok(self.canvas().save())
     }
     pub fn save_layer(&self, save_layer_rec: LuaSaveLayerRec) -> usize {
-        Ok(self
-            .canvas()
-            .save_layer(&save_layer_rec.to_skia_save_layer_rec()))
+        let rec = save_layer_rec.to_skia_save_layer_rec();
+        Ok(self.canvas().save_layer(&rec))
     }
     pub fn restore(&self) {
         self.canvas().restore();

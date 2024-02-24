@@ -4,7 +4,10 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use mlua::prelude::*;
-use skia_safe::{Color, Color4f, IPoint, IRect, ISize, Point, Point3, Rect};
+use skia_safe::{
+    font_style::{Weight, Width},
+    Color, Color4f, IPoint, IRect, ISize, Point, Point3, Rect,
+};
 
 use crate::{from_lua_argpack, ArgumentContext, FromArgPack, LuaType};
 
@@ -796,5 +799,153 @@ impl<'lua> TryFrom<LuaTable<'lua>> for SidePack {
                 )),
             }),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct LuaFontWeight(pub i32);
+
+impl LuaFontWeight {
+    pub fn to_skia_weight(&self) -> Weight {
+        Weight::from(self.0)
+    }
+}
+
+impl<'lua> FromArgPack<'lua> for LuaFontWeight {
+    fn convert(args: &mut ArgumentContext<'lua>, _lua: &'lua Lua) -> LuaResult<Self> {
+        static EXPECTED: &str = "'invisible', 'thin', 'extra_light', 'light', 'normal', 'medium', 'semi_bold', 'bold', 'extra_bold', 'black', 'extra_black'";
+        match args.pop() {
+            LuaNil => Ok(LuaFontWeight(*Weight::NORMAL)),
+            LuaValue::Integer(number) => {
+                if number < 0 {
+                    return Err(LuaError::RuntimeError(
+                        "font weight can't be a negative value".to_string(),
+                    ));
+                }
+                Ok(LuaFontWeight(number as i32))
+            }
+            LuaValue::Number(number) => {
+                if number < 0. {
+                    return Err(LuaError::RuntimeError(
+                        "font weight can't be a negative value".to_string(),
+                    ));
+                }
+                if number.is_infinite() {
+                    return Err(LuaError::RuntimeError(
+                        "font weight must be finite".to_string(),
+                    ));
+                }
+                if number.is_nan() {
+                    return Err(LuaError::RuntimeError(
+                        "invalid (NaN) font weight".to_string(),
+                    ));
+                }
+                Ok(LuaFontWeight(number.floor() as i32))
+            }
+            LuaValue::String(name) => match name.to_str()? {
+                "invisible" => Ok(LuaFontWeight(*Weight::INVISIBLE)),
+                "thin" => Ok(LuaFontWeight(*Weight::THIN)),
+                "extra_light" => Ok(LuaFontWeight(*Weight::EXTRA_LIGHT)),
+                "light" => Ok(LuaFontWeight(*Weight::LIGHT)),
+                "normal" => Ok(LuaFontWeight(*Weight::NORMAL)),
+                "medium" => Ok(LuaFontWeight(*Weight::MEDIUM)),
+                "semi_bold" => Ok(LuaFontWeight(*Weight::SEMI_BOLD)),
+                "bold" => Ok(LuaFontWeight(*Weight::BOLD)),
+                "extra_bold" => Ok(LuaFontWeight(*Weight::EXTRA_BOLD)),
+                "black" => Ok(LuaFontWeight(*Weight::BLACK)),
+                "extra_black" => Ok(LuaFontWeight(*Weight::EXTRA_BLACK)),
+                other => Err(LuaError::RuntimeError(format!(
+                    "unknown weight name: '{}'; expected a number or one of: {}",
+                    other, EXPECTED
+                ))),
+            },
+            other => Err(LuaError::RuntimeError(format!(
+                "invalid font weight: '{:?}'; expected a number or name ({})",
+                other, EXPECTED
+            ))),
+        }
+    }
+}
+
+impl<'lua> IntoLua<'lua> for LuaFontWeight {
+    fn into_lua(self, _: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
+        Ok(LuaValue::Integer(self.0 as i64))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct LuaFontWidth(pub i32);
+
+impl LuaFontWidth {
+    pub fn to_skia_width(&self) -> Width {
+        Width::from(self.0)
+    }
+}
+
+impl<'lua> FromArgPack<'lua> for LuaFontWidth {
+    fn convert(args: &mut ArgumentContext<'lua>, _lua: &'lua Lua) -> LuaResult<Self> {
+        static EXPECTED: &str = "'invisible', 'thin', 'extra_light', 'light', 'normal', 'medium', 'semi_bold', 'bold', 'extra_bold', 'black', 'extra_black'";
+        match args.pop() {
+            LuaNil => Ok(LuaFontWidth(*Width::NORMAL)),
+            LuaValue::Integer(number) => {
+                if number < 0 {
+                    return Err(LuaError::RuntimeError(
+                        "font width can't be a negative value".to_string(),
+                    ));
+                }
+                Ok(LuaFontWidth(number as i32))
+            }
+            LuaValue::Number(number) => {
+                if number < 0. {
+                    return Err(LuaError::RuntimeError(
+                        "font width can't be a negative value".to_string(),
+                    ));
+                }
+                if number.is_infinite() {
+                    return Err(LuaError::RuntimeError(
+                        "font width must be finite".to_string(),
+                    ));
+                }
+                if number.is_nan() {
+                    return Err(LuaError::RuntimeError(
+                        "invalid (NaN) font width".to_string(),
+                    ));
+                }
+                Ok(LuaFontWidth(number.floor() as i32))
+            }
+            LuaValue::String(name) => match name.to_str()? {
+                "ultra_condensed" => Ok(LuaFontWidth(*Width::ULTRA_CONDENSED)),
+                "extra_condensed" => Ok(LuaFontWidth(*Width::EXTRA_CONDENSED)),
+                "condensed" => Ok(LuaFontWidth(*Width::CONDENSED)),
+                "semi_condensed" => Ok(LuaFontWidth(*Width::SEMI_CONDENSED)),
+                "normal" => Ok(LuaFontWidth(*Width::NORMAL)),
+                "semi_expanded" => Ok(LuaFontWidth(*Width::SEMI_EXPANDED)),
+                "expanded" => Ok(LuaFontWidth(*Width::EXPANDED)),
+                "extra_expanded" => Ok(LuaFontWidth(*Width::EXTRA_EXPANDED)),
+                "ultra_expanded" => Ok(LuaFontWidth(*Width::ULTRA_EXPANDED)),
+                other => Err(LuaError::FromLuaConversionError {
+                    from: "string",
+                    to: "Width",
+                    message: Some(format!(
+                        "unknown width name: '{}'; expected a number or one of: {}",
+                        other, EXPECTED
+                    )),
+                }),
+            },
+            other => Err(LuaError::FromLuaConversionError {
+                from: other.type_name(),
+                to: "Width",
+                message: Some(format!(
+                    "invalid font width: '{:?}'; expected a number or name ({})",
+                    other, EXPECTED
+                )),
+            }),
+        }
+    }
+}
+
+impl<'lua> IntoLua<'lua> for LuaFontWidth {
+    fn into_lua(self, _: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
+        Ok(LuaValue::Integer(self.0 as i64))
     }
 }

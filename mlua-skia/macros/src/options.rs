@@ -225,17 +225,13 @@ impl Parse for ItemOptions {
 impl ItemOptions {
     pub fn check(meta: &Meta) -> bool {
         match meta {
-            Meta::Path(path)
-                if path.segments.len() == 1
-                    && path.segments.first().map(|it| it.ident == "lua") == Some(true) =>
-            {
-                true
+            Meta::Path(path) => {
+                path.segments.len() == 1
+                    && path.segments.first().map(|it| it.ident == "lua") == Some(true)
             }
-            Meta::List(list)
-                if list.path.segments.len() == 1
-                    && list.path.segments.first().map(|it| it.ident == "lua") == Some(true) =>
-            {
-                true
+            Meta::List(list) => {
+                list.path.segments.len() == 1
+                    && list.path.segments.first().map(|it| it.ident == "lua") == Some(true)
             }
             _ => false,
         }
