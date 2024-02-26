@@ -1,5 +1,6 @@
 use std::{
     fmt::{Display, Write},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -75,6 +76,8 @@ pub enum RenderError {
 
 #[derive(Debug, Error)]
 pub enum ClunkyError {
+    #[error("invalid script path: {0}")]
+    InvalidScript(PathBuf),
     #[error("empty component type string")]
     EmptyComponentType,
     #[error("unknown component type '{found}'{detail}")]
@@ -95,9 +98,9 @@ pub enum ClunkyError {
     IO(#[from] std::io::Error),
 }
 
-impl Into<mlua::Error> for ClunkyError {
-    fn into(self) -> mlua::Error {
-        match self {
+impl From<ClunkyError> for mlua::Error {
+    fn from(val: ClunkyError) -> Self {
+        match val {
             ClunkyError::Lua(err) => err,
             other => mlua::Error::ExternalError(Arc::new(other)),
         }

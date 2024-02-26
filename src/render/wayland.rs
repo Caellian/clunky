@@ -102,8 +102,7 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
     type QH = QueueHandle<Self>;
 
     fn create(config: TargetConfig) -> Result<(Self, Connection, EventQueue<Self>), ClunkyError> {
-        let connection =
-            Connection::connect_to_env().map_err(|err| RenderError::WaylandConnect(err))?;
+        let connection = Connection::connect_to_env().map_err(RenderError::WaylandConnect)?;
 
         let event_queue: EventQueue<Self> = connection.new_event_queue();
         let qhandle = event_queue.handle();
@@ -221,13 +220,13 @@ impl RenderTarget<EventQueue<Self>> for WaylandState {
 #[inline]
 fn position_to_margins(anchor: Anchor, position: IVec2) -> (i32, i32, i32, i32) {
     let (top, bottom) = match anchor.difference(Anchor::Left | Anchor::Right) {
-        Anchor::Top => (position.y as i32, 0),
-        Anchor::Bottom => (0, -position.y as i32),
+        Anchor::Top => (position.y, 0),
+        Anchor::Bottom => (0, -position.y),
         _ => (0, 0),
     };
     let (right, left) = match anchor.difference(Anchor::Top | Anchor::Bottom) {
-        Anchor::Left => (0, position.x as i32),
-        Anchor::Right => (-position.x as i32, 0),
+        Anchor::Left => (0, position.x),
+        Anchor::Right => (-position.x, 0),
         _ => (0, 0),
     };
 
@@ -334,6 +333,7 @@ macro_rules! stub_listener {
 
 stub_listener!(wl_compositor::WlCompositor);
 
+#[allow(clippy::single_match)]
 impl Dispatch<WlSurface, ()> for WaylandState {
     fn event(
         _: &mut Self,
@@ -350,6 +350,7 @@ impl Dispatch<WlSurface, ()> for WaylandState {
     }
 }
 
+#[allow(clippy::single_match)]
 impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
     fn event(
         state: &mut Self,
@@ -377,6 +378,7 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
 
 stub_listener!(wl_shm_pool::WlShmPool);
 
+#[allow(clippy::single_match)]
 impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandState {
     fn event(
         _state: &mut Self,

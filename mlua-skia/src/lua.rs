@@ -2,6 +2,7 @@
 //!
 //! This module provides a lot of utility wrappers and traits that make it
 //! easier to handle conversion from Lua types.
+#![allow(dead_code)]
 
 use std::{fmt::Display, mem::MaybeUninit, ops::Deref, sync::Arc};
 

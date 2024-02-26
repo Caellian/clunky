@@ -1,6 +1,5 @@
 use std::{
-    error::Error,
-    process::exit,
+    path::Path,
     ptr::addr_of,
     thread::sleep,
     time::{Duration, Instant},
@@ -11,14 +10,21 @@ use clap::Parser;
 use env_logger::Env;
 use glam::{IVec2, UVec2};
 use mlua::prelude::*;
+use notify::Watcher;
 use render::{
     frontend::{bindings::LuaCanvas, FrameBufferSurface},
     RenderTarget, RenderTargetImpl, TargetConfig,
 };
-use script::{events::EventBuffer, settings::Settings};
+use script::{data::DataCollectors, events::EventBuffer};
 use skia_safe::{Color, Color4f};
 
-use crate::script::ScriptContext;
+use crate::{
+    script::{
+        events::{EventChannel, EventData, TargetFile},
+        ScriptContext,
+    },
+    util::ErrHandleExt,
+};
 
 mod args;
 pub mod error;
@@ -26,86 +32,78 @@ pub mod render;
 pub mod script;
 pub mod util;
 
-fn main() {
-    env_logger::init_from_env(Env::default().default_filter_or("info"));
-
-    let args = Arguments::parse();
-
-    let script = match ScriptContext::new(args.script) {
-        Ok(it) => it,
-        Err(err) => {
-            print_stack_trace(&err);
-            exit(1);
-        }
-    };
-
-    let (settings, mut collectors) = {
-        let mut s = script.load_settings();
-        let collectors = s.data_collectors.take().unwrap_or_default();
-        (s, collectors)
-    };
-    let (mut evb, state) = {
-        let mut evb = EventBuffer::new();
-
-        let (state, scheduled) = collectors
-            .update_state(script.lua(), None)
-            .expect("unable to initialize state table");
-
-        evb.schedule(scheduled);
-
-        (evb, state)
-    };
-
-    let max_w = 1920;
-    let max_h = 1050;
-
-    let (mut target, _, mut queue) = RenderTargetImpl::create(TargetConfig {
-        position: IVec2::new(0, 0),
-        size: UVec2::new(max_w, max_h),
-        ..Default::default()
-    })
-    .expect("unable to create a render target");
-
-    draw_frame(&mut target, queue.handle(), &script, &settings, state);
-
-    // https://gafferongames.com/post/fix_your_timestep/
-    let initial = Instant::now();
-    let mut prev = initial;
-    while target.running() {
-        let current = Instant::now();
-        log::debug!("frame time: {}ms", (current - prev).as_millis());
-        prev = current;
-
-        queue.blocking_dispatch(&mut target).unwrap();
-        let mut scheduled = evb.take_scheduled();
-
-        let (state, scheduled) = collectors
-            .update_state(script.lua(), Some(&mut scheduled))
-            .expect("can't update state");
-        evb.schedule(scheduled);
-
-        if target.can_render() {
-            draw_frame(&mut target, queue.handle(), &script, &settings, state);
-        } else {
-            sleep(Duration::from_millis(1));
-        }
-    }
+pub struct MainState {
+    script: Option<ScriptContext>,
+    collectors: DataCollectors,
+    evb: EventBuffer,
 }
 
-fn draw_frame<Q, T: RenderTarget<Q>>(
-    target: &mut T,
-    qh: T::QH,
-    script: &ScriptContext,
-    settings: &Settings,
-    state: LuaRegistryKey,
-) {
-    if let Some(draw_cb) = &settings.draw {
-        let render_fn: LuaFunction = match script.lua().registry_value(draw_cb) {
-            Ok(it) => it,
-            Err(err) => {
-                print_stack_trace(&err);
-                exit(1);
+impl MainState {
+    pub fn init(script_path: impl AsRef<Path>) -> Self {
+        let mut script =
+            ScriptContext::new(script_path).some_or_log(Some("script load error".to_string()));
+
+        let mut collectors = match &mut script {
+            Some(it) => it.settings.take_collectors(),
+            None => DataCollectors::default(),
+        };
+
+        let mut evb = EventBuffer::new();
+        collectors
+            .init_state(script.as_mut(), &mut evb)
+            .expect("unable to initialize state table");
+
+        MainState {
+            script,
+            collectors,
+            evb,
+        }
+    }
+
+    pub fn reload(&mut self, script_path: impl AsRef<Path>) {
+        let script = match &mut self.script {
+            Some(script) => {
+                script
+                    .reload(script_path)
+                    .some_or_log(Some("script load error".to_string()));
+                script
             }
+            None => {
+                match ScriptContext::new(script_path)
+                    .some_or_log(Some("script load error".to_string()))
+                {
+                    Some(it) => {
+                        self.script = Some(it);
+                        self.script.as_mut().unwrap()
+                    }
+                    None => {
+                        self.collectors = DataCollectors::default();
+                        return;
+                    }
+                }
+            }
+        };
+        self.collectors = script.settings.take_collectors();
+        self.collectors
+            .init_state(Some(script), &mut self.evb)
+            .expect("unable to initialize state table");
+    }
+
+    pub fn script_tick(&mut self) {
+        self.collectors
+            .update_state(self.script.as_mut(), &mut self.evb)
+            .expect("can't update state");
+    }
+
+    pub fn draw_frame<Q, T: RenderTarget<Q>>(&mut self, target: &mut T, qh: T::QH) {
+        let script = match &self.script {
+            Some(it) => it,
+            None => return,
+        };
+
+        let draw_fn: LuaFunction = match script.draw_fn() {
+            Some(it) => it,
+            None => return,
         };
 
         let mut surface = target.buffer().to_surface();
@@ -123,30 +121,96 @@ fn draw_frame<Q, T: RenderTarget<Q>>(
             LuaCanvas::Borrowed(addr_of!(*surface.canvas()).as_ref().unwrap_unchecked())
         };
 
-        let state_value: LuaTable = script
-            .lua()
-            .registry_value(&state)
-            .expect("expired state in registry");
+        let state_value = script.collected_data().expect("expired state in registry");
 
-        if let Err(err) = render_fn
+        draw_fn
             .call::<(LuaCanvas, LuaTable), ()>((canvas, state_value))
-            .map_err(crate::error::ClunkyError::Lua)
-        {
-            print_stack_trace(&err);
-            exit(1);
-        }
-
-        let _ = script.lua().remove_registry_value(state);
+            .some_or_log(Some("render function error".to_string()));
 
         target.push_frame(qh);
     }
 }
 
-fn print_stack_trace(error: &dyn Error) {
-    log::error!("{}", error);
-    let mut current = error.source();
-    while let Some(err) = current {
-        log::error!("{}", err);
-        current = err.source();
+fn main() {
+    env_logger::init_from_env(Env::default().default_filter_or("info"));
+    let args = Arguments::parse();
+
+    let mut state = MainState::init(&args.script);
+
+    let watcher_evb = state.evb.clone();
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| match res {
+            Ok(event) => match event.kind {
+                notify::EventKind::Any
+                | notify::EventKind::Create(_)
+                | notify::EventKind::Modify(_) => {
+                    log::info!("user script updated");
+                    watcher_evb.schedule_event(EventData::FileReload {
+                        time: Instant::now(),
+                        file: TargetFile::UserScript,
+                    })
+                }
+                _ => {}
+            },
+            Err(err) => {
+                log::warn!("script watch error: {}", err);
+            }
+        })
+        .ok();
+
+    if let Some(watcher) = &mut watcher {
+        if let Err(err) = watcher.watch(&args.script, notify::RecursiveMode::NonRecursive) {
+            log::warn!("error to watch user script for changes: {}", err);
+        }
+    } else {
+        log::warn!("unable to watch user script for changes");
+    }
+
+    let max_w = 1920;
+    let max_h = 1050;
+
+    let (mut target, _, mut queue) = RenderTargetImpl::create(TargetConfig {
+        position: IVec2::new(0, 0),
+        size: UVec2::new(max_w, max_h),
+        ..Default::default()
+    })
+    .expect("unable to create a render target");
+
+    state.draw_frame(&mut target, queue.handle());
+
+    // https://gafferongames.com/post/fix_your_timestep/
+    let initial = Instant::now();
+    let mut prev = initial;
+    while target.running() {
+        let current = Instant::now();
+        log::debug!("frame time: {}ms", (current - prev).as_millis());
+        prev = current;
+
+        queue.blocking_dispatch(&mut target).unwrap();
+
+        if state
+            .evb
+            .poll_filter(EventChannel::FS_NOTIFY, |it| {
+                matches!(
+                    it,
+                    EventData::FileReload {
+                        file: TargetFile::UserScript,
+                        ..
+                    }
+                )
+            })
+            .count()
+            > 0
+        {
+            state.reload(&args.script);
+        }
+
+        state.script_tick();
+
+        if target.can_render() {
+            state.draw_frame(&mut target, queue.handle());
+        } else {
+            sleep(Duration::from_millis(1));
+        }
     }
 }

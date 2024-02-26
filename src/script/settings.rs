@@ -11,7 +11,7 @@ pub struct Settings {
     /// Can't be lower than 200ms
     pub update_frequency: u32,
 
-    pub data_collectors: Option<DataCollectors>,
+    pub data_collectors: DataCollectors,
 
     pub draw: Option<RegistryKey>,
 }
@@ -22,7 +22,7 @@ impl Default for Settings {
             framerate: 60,
             update_frequency: 1000,
 
-            data_collectors: None,
+            data_collectors: DataCollectors::default(),
 
             draw: None,
         }
@@ -42,7 +42,7 @@ impl Settings {
         }
 
         if let Ok(collectors) = table.get::<_, Table>("collectors") {
-            result.data_collectors = Some(DataCollectors::new_lua_collectors(ctx, collectors)?);
+            result.data_collectors = DataCollectors::new_lua_collectors(ctx, collectors)?;
         }
 
         if let Ok(draw) = table.get::<_, Function>("draw") {
@@ -50,5 +50,9 @@ impl Settings {
         }
 
         Ok(result)
+    }
+
+    pub fn take_collectors(&mut self) -> DataCollectors {
+        std::mem::take(&mut self.data_collectors)
     }
 }

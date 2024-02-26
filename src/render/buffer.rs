@@ -74,7 +74,7 @@ impl FrameParameters {
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
+    pub fn length(&self) -> usize {
         (self.dimensions.x * self.dimensions.y) as usize * self.format.pixel_size()
     }
 }
@@ -95,10 +95,10 @@ impl FrameBuffer {
         qh: &QueueHandle<WaylandState>,
     ) -> Result<Self, std::io::Error> {
         let source = tempfile::tempfile()?;
-        source.set_len(params.len() as u64)?;
+        source.set_len(params.length() as u64)?;
         let mmap = unsafe { MmapMut::map_mut(&source)? };
 
-        let pool = shm.create_pool(source.as_fd(), params.len() as i32, qh, ());
+        let pool = shm.create_pool(source.as_fd(), params.length() as i32, qh, ());
         let buffer = pool.create_buffer(
             0,
             params.dimensions.x as i32,
@@ -127,7 +127,7 @@ impl FrameBuffer {
         params.dimensions.x = params.dimensions.x.max(1);
         params.dimensions.y = params.dimensions.y.max(1);
 
-        let new_len = params.len();
+        let new_len = params.length();
 
         self.wl_buffer.destroy();
 

@@ -1,11 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
-use drain_filter_polyfill::VecExt;
 use mlua::prelude::{Lua, LuaError, LuaRegistryKey as RegistryKey, LuaResult, LuaTable, LuaValue};
 
-use crate::script::events::Consumer;
-
-use super::events::{EventData, Status};
+use super::{
+    events::{EventBuffer, EventChannel, EventData, Status},
+    ScriptContext,
+};
 
 #[derive(Debug, Clone)]
 pub struct CollectorCallback(Arc<RegistryKey>);
@@ -17,12 +17,12 @@ impl CollectorCallback {
     }
 }
 
-type CollectorState = HashMap<String, RegistryKey>;
+type CollectedEntries = HashMap<String, RegistryKey>;
 
 #[derive(Debug)]
 pub struct DataCollectors {
     pub collectors: HashMap<String, CollectorCallback>,
-    pub state: CollectorState,
+    pub state: CollectedEntries,
 }
 
 impl Default for DataCollectors {
@@ -62,105 +62,134 @@ impl DataCollectors {
         Ok(result)
     }
 
-    pub fn update_state<'lua>(
+    pub fn init_state(
         &mut self,
-        ctx: &'lua Lua,
-        scheduled: Option<&mut Vec<EventData>>,
-    ) -> LuaResult<(RegistryKey, Vec<EventData>)> {
-        let table = ctx.create_table()?;
+        ctx: Option<&mut ScriptContext>,
+        evb: &mut EventBuffer,
+    ) -> LuaResult<()> {
+        let ctx = match ctx {
+            Some(it) => it,
+            None => return Ok(()),
+        };
+
+        let table = ctx.lua().create_table()?;
 
         // retain previous values, if any
         for (name, key) in &self.state {
-            if let Ok(value) = ctx.registry_value::<LuaValue>(&key) {
+            if let Ok(value) = ctx.lua().registry_value::<LuaValue>(key) {
                 table.set(name.as_str(), value)?;
             }
         }
 
-        fn run_callback<'lua>(
-            ctx: &'lua Lua,
-            name: &str,
-            cb: &CollectorCallback,
-        ) -> Option<(Status, LuaValue<'lua>)> {
-            let value = cb.value(&ctx);
-            let status = Status::default();
+        evb.schedule(self.collectors.iter().filter_map(|(name, callback)| {
+            handle_callback(ctx, &table, &mut self.state, name, callback)
+        }));
 
-            let returned = match value {
-                LuaValue::Function(callback) => match callback.call(status.clone()) {
-                    Ok(it) => it,
-                    Err(err) => {
-                        log::warn!("data collector callback for '{}' failed: {}", name, err);
-                        return None;
-                    }
-                },
-                other => other,
-            };
+        let mut data = ctx.lua().create_registry_value(table)?;
+        std::mem::swap(&mut ctx.collected_data, &mut data);
+        ctx.lua().remove_registry_value(data)?;
 
-            Some((status, returned))
-        }
+        Ok(())
+    }
 
-        fn handle_callback<'lua>(
-            ctx: &'lua Lua,
-            results: &LuaTable<'lua>,
-            state: &mut CollectorState,
-            name: &str,
-            cb: &CollectorCallback,
-        ) -> Option<EventData> {
-            let (status, value) = match run_callback(ctx, &name, cb) {
-                Some(it) => it,
-                None => return None,
-            };
-
-            match results.set(name, value.clone()) {
-                Ok(()) => {}
-                Err(error) => {
-                    log::error!("unable to update callback result table: {}", error)
-                }
-            }
-
-            let next_event = if let Some(next_update) = status.next_update() {
-                Some(EventData::DataUpdate {
-                    time: next_update,
-                    name: name.to_string(),
-                    callback: cb.clone(),
-                })
-            } else {
-                None
-            };
-
-            let new_key = match ctx.create_registry_value(value) {
-                Ok(it) => it,
-                Err(error) => {
-                    log::warn!("unable to commit value to state: {}", error);
-                    return next_event;
-                }
-            };
-
-            state.insert(name.to_string(), new_key);
-
-            next_event
-        }
-
-        let scheduled_next: Vec<_> = if let Some(scheduled) = scheduled {
-            let drain = scheduled.drain_filter(|it| it.consumer() == Consumer::DataCollectors);
-            let scheduled = drain
-                .filter_map(|ev| match ev {
-                    EventData::DataUpdate { name, callback, .. } => {
-                        handle_callback(ctx, &table, &mut self.state, &name, &callback)
-                    }
-                })
-                .collect();
-            scheduled
-        } else {
-            // initial run, allow initial scheduling
-            self.collectors
-                .iter()
-                .filter_map(|(name, callback)| {
-                    handle_callback(ctx, &table, &mut self.state, name, callback)
-                })
-                .collect()
+    pub fn update_state(
+        &mut self,
+        ctx: Option<&mut ScriptContext>,
+        evb: &mut EventBuffer,
+    ) -> LuaResult<()> {
+        let ctx = match ctx {
+            Some(it) => it,
+            None => return Ok(()),
         };
 
-        let table = ctx.create_registry_value(table)?;
-        Ok((table, scheduled_next))
+        let table = ctx.lua().create_table()?;
+
+        // retain previous values, if any
+        for (name, key) in &self.state {
+            if let Ok(value) = ctx.lua().registry_value::<LuaValue>(key) {
+                table.set(name.as_str(), value)?;
+            }
+        }
+
+        let next: Vec<_> = evb
+            .poll(EventChannel::DATA)
+            .filter_map(|ev| match ev {
+                EventData::DataUpdate { name, callback, .. } => {
+                    handle_callback(ctx, &table, &mut self.state, &name, &callback)
+                }
+                _ => None,
+            })
+            .collect();
+        evb.schedule(next);
+
+        let mut data = ctx.lua().create_registry_value(table)?;
+        std::mem::swap(&mut ctx.collected_data, &mut data);
+        ctx.lua().remove_registry_value(data)?;
+
+        Ok(())
     }
+}
+
+fn run_callback<'lua>(
+    lua: &'lua Lua,
+    name: &str,
+    cb: &CollectorCallback,
+) -> Option<(Status, LuaValue<'lua>)> {
+    let value = cb.value(lua);
+    let status = Status::default();
+
+    let returned = match value {
+        LuaValue::Function(callback) => match callback.call(status.clone()) {
+            Ok(it) => it,
+            Err(err) => {
+                log::warn!("data collector callback for '{}' failed: {}", name, err);
+                return None;
+            }
+        },
+        other => other,
+    };
+
+    Some((status, returned))
+}
+
+fn handle_callback(
+    ctx: &ScriptContext,
+    results: &LuaTable,
+    state: &mut CollectedEntries,
+    name: &str,
+    cb: &CollectorCallback,
+) -> Option<EventData> {
+    let lua = ctx.lua();
+
+    let (status, value) = match run_callback(lua, name, cb) {
+        Some(it) => it,
+        None => return None,
+    };
+
+    match results.set(name, value.clone()) {
+        Ok(()) => {}
+        Err(error) => {
+            log::error!("unable to update callback result table: {}", error)
+        }
+    }
+
+    let next_event = status
+        .next_update()
+        .map(|next_update| EventData::DataUpdate {
+            time: next_update,
+            name: name.to_string(),
+            callback: cb.clone(),
+        });
+
+    let new_key = match lua.create_registry_value(value) {
+        Ok(it) => it,
+        Err(error) => {
+            log::warn!("unable to commit value to state: {}", error);
+            return next_event;
+        }
+    };
+
+    state.insert(name.to_string(), new_key);
+
+    next_event
 }
